@@ -94,7 +94,7 @@ function tierFor(elo) {
 
 function formatTierTitle(t) {
   const labels = db.config.tierLabels || DEFAULT_TIER_LABELS;
-  return `Тир ${labels[t] ?? t}`;
+  return `${labels[t] ?? t}`;
 }
 
 function isModerator(member) {
@@ -189,9 +189,13 @@ async function updateIndex(client) {
   await indexMsg.edit({ embeds: [buildIndexEmbed()] });
 }
 
-async function upsertCardMessage(client, rating, approvedByTag) {
-  const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID);
+
+async function upsertCardMessage(client, rating, approvedByTag, proofFile) {
+  const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
+
+  const proofName = rating.proofFileName || proofFile?.name || `proof_${rating.userId}.png`;
+  rating.proofFileName = proofName;
 
   const embed = new EmbedBuilder()
     .setAuthor({
@@ -202,28 +206,38 @@ async function upsertCardMessage(client, rating, approvedByTag) {
     .addFields(
       { name: "Тир", value: `**${rating.tier}**`, inline: true },
       { name: "ELO", value: `**${rating.elo}**`, inline: true },
-      { name: "Пруф", value: rating.proofUrl ? `[скрин](${rating.proofUrl})` : "—", inline: true }
+      { name: "Пруф", value: proofFile ? "см. изображение ниже" : (rating.proofUrl ? `[скрин](${rating.proofUrl})` : "—"), inline: true }
     )
     .setFooter({ text: `Approved by ${approvedByTag}` });
 
-  if (rating.proofUrl) embed.setImage(rating.proofUrl);
+  if (proofFile) embed.setImage(`attachment://${proofName}`);
+  else if (rating.proofUrl) embed.setImage(rating.proofUrl);
 
+  // если уже была карточка — удалим и создадим заново (так можно заменить пруф)
   if (rating.cardMessageId) {
-    try {
-      const msg = await channel.messages.fetch(rating.cardMessageId);
-      await msg.edit({ embeds: [embed] });
-      return;
-    } catch {
-      rating.cardMessageId = "";
-    }
+    const old = await channel.messages.fetch(rating.cardMessageId).catch(() => null);
+    if (old) await old.delete().catch(() => {});
+    rating.cardMessageId = "";
   }
 
-  const msg = await channel.send({ embeds: [embed] });
+  const payload = { embeds: [embed] };
+
+  if (proofFile?.attachment) {
+    payload.files = [{ attachment: proofFile.attachment, name: proofName }];
+  }
+
+  const msg = await channel.send(payload).catch(() => null);
+  if (!msg) return;
+
   rating.cardMessageId = msg.id;
+
+  const att = msg.attachments.find(a => a.name === proofName) || msg.attachments.first();
+  if (att) rating.proofUrl = att.url;
 }
 
 // ====== REVIEW UI ======
 function buildReviewEmbed(sub, statusLabel, extraFields = []) {
+  const imageRef = sub.screenshotFileName ? `attachment://${sub.screenshotFileName}` : sub.screenshotUrl;
   const e = new EmbedBuilder()
     .setTitle(`ELO заявка (${statusLabel})`)
     .setDescription(
@@ -233,7 +247,7 @@ function buildReviewEmbed(sub, statusLabel, extraFields = []) {
       `Сообщение: [link](${sub.messageUrl})\n` +
       `ID: \`${sub.id}\``
     )
-    .setImage(sub.screenshotUrl);
+    .setImage(imageRef);
 
   if (extraFields.length) e.addFields(...extraFields);
   return e;
@@ -348,6 +362,8 @@ client.on("messageCreate", async (message) => {
   }
 
   const submissionId = makeId();
+  const ext = (path.extname(attachment.name || "") || ".png").toLowerCase();
+  const screenshotFileName = `proof_${submissionId}${ext}`;
   db.submissions[submissionId] = {
     id: submissionId,
     userId: message.author.id,
@@ -355,6 +371,7 @@ client.on("messageCreate", async (message) => {
     elo,
     tier,
     screenshotUrl: attachment.url,
+    screenshotFileName,
     messageUrl: message.url,
     status: "pending",
     createdAt: new Date().toISOString(),
@@ -373,7 +390,11 @@ client.on("messageCreate", async (message) => {
   const sent = await reviewChannel.send({
     embeds: [buildReviewEmbed(sub, "pending")],
     components: [buildReviewButtons(submissionId)],
+    files: [{ attachment: attachment.url, name: screenshotFileName }],
   });
+
+  const savedAtt = sent.attachments.find(a => a.name === screenshotFileName) || sent.attachments.first();
+  if (savedAtt) sub.screenshotUrl = savedAtt.url;
 
   // сохраняем, чтобы модалки могли редактировать сообщение
   sub.reviewChannelId = sent.channel.id;
@@ -589,14 +610,23 @@ client.on("interactionCreate", async (interaction) => {
       rating.name = sub.name;
       rating.elo = sub.elo;
       rating.tier = tier;
-      rating.proofUrl = sub.screenshotUrl;
+
+const proofExt = (path.extname(sub.screenshotFileName || "") || ".png").toLowerCase();
+rating.proofFileName = `proof_${sub.userId}${proofExt}`;
+
+let proofAttachmentUrl = sub.screenshotUrl;
+const reviewMsg = await fetchReviewMessage(client, sub);
+const reviewAtt = reviewMsg?.attachments?.find(a => a.name === sub.screenshotFileName) || reviewMsg?.attachments?.first();
+if (reviewAtt) proofAttachmentUrl = reviewAtt.url;
+
+rating.proofUrl = proofAttachmentUrl;
       rating.avatarUrl = user.displayAvatarURL({ size: 128 });
       rating.updatedAt = new Date().toISOString();
 
       db.ratings[sub.userId] = rating;
       saveDB(db);
 
-      await upsertCardMessage(client, rating, interaction.user.tag);
+      await upsertCardMessage(client, rating, interaction.user.tag, { attachment: proofAttachmentUrl, name: rating.proofFileName });
       saveDB(db);
       await updateIndex(client);
 
