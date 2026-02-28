@@ -28,6 +28,7 @@ const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID;
 const TIERLIST_CHANNEL_ID = process.env.TIERLIST_CHANNEL_ID;
 const MOD_ROLE_ID = process.env.MOD_ROLE_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "";
+const TIERLIST_ROLE_ID = process.env.TIERLIST_ROLE_ID || "";
 
 const SUBMIT_COOLDOWN_SECONDS = 120; // кулдаун на ВАЛИДНУЮ заявку
 const PENDING_EXPIRE_HOURS = 48;     // протухание pending
@@ -160,6 +161,42 @@ function isModerator(member) {
   if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
   if (MOD_ROLE_ID && member.roles?.cache?.has(MOD_ROLE_ID)) return true;
   return false;
+}
+
+// ====== ROLE: TIERLIST MEMBER ======
+let _tierlistGuildCache = null;
+
+async function getTierlistGuild(client) {
+  if (_tierlistGuildCache) return _tierlistGuildCache;
+  if (!GUILD_ID) return null;
+  _tierlistGuildCache = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  return _tierlistGuildCache;
+}
+
+async function setTierlistRole(client, userId, shouldHave, reason = "tierlist") {
+  if (!TIERLIST_ROLE_ID) return;
+  const guild = await getTierlistGuild(client);
+  if (!guild) return;
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return;
+
+  const has = member.roles.cache.has(TIERLIST_ROLE_ID);
+  if (shouldHave && !has) {
+    await member.roles.add(TIERLIST_ROLE_ID, reason).catch(() => {});
+  } else if (!shouldHave && has) {
+    await member.roles.remove(TIERLIST_ROLE_ID, reason).catch(() => {});
+  }
+}
+
+async function syncTierlistRolesOnStart(client) {
+  if (!TIERLIST_ROLE_ID) return;
+  const ids = Object.keys(db.ratings || {});
+  if (!ids.length) return;
+
+  for (const uid of ids) {
+    await setTierlistRole(client, uid, true, "sync from db");
+  }
 }
 
 function hoursSince(iso) {
@@ -343,7 +380,12 @@ async function registerGuildCommands(client) {
 
 // ====== DISCORD CLIENT ======
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ],
 });
 
 client.once("ready", async () => {
@@ -354,6 +396,7 @@ client.once("ready", async () => {
 
   await ensureIndexMessage(client);
   await updateIndex(client);
+  await syncTierlistRolesOnStart(client);
 
   console.log("Ready");
 });
@@ -575,6 +618,7 @@ client.on("interactionCreate", async (interaction) => {
       delete db.ratings[target.id];
       saveDB(db);
       await updateIndex(client);
+      await setTierlistRole(client, target.id, false, "Removed from tierlist");
 
       await interaction.reply({ content: `Удалил <@${target.id}> из тир-листа.`, ephemeral: true });
       return;
@@ -599,6 +643,11 @@ client.on("interactionCreate", async (interaction) => {
             if (msg) await msg.delete().catch(() => {});
           }
         }
+      }
+
+      const _wipeIds = Object.keys(db.ratings || {});
+      for (const uid of _wipeIds) {
+        await setTierlistRole(client, uid, false, "Wipe ratings");
       }
 
       db.ratings = {};
@@ -679,6 +728,7 @@ client.on("interactionCreate", async (interaction) => {
       await upsertCardMessage(client, rating, interaction.user.tag);
       saveDB(db);
       await updateIndex(client);
+      await setTierlistRole(client, sub.userId, true, "Approved to tierlist");
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён.", ephemeral: true });
