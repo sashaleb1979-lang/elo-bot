@@ -42,7 +42,7 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "db.json");
 
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    return { config: {}, submissions: {}, ratings: {}, cooldowns: {} };
+    return { config: {}, submissions: {}, ratings: {}, cooldowns: {}, miniCards: {} };
   }
   try {
     const data = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
@@ -50,9 +50,10 @@ function loadDB() {
     data.submissions ||= {};
     data.ratings ||= {};
     data.cooldowns ||= {};
+    data.miniCards ||= {};
     return data;
   } catch {
-    return { config: {}, submissions: {}, ratings: {}, cooldowns: {} };
+    return { config: {}, submissions: {}, ratings: {}, cooldowns: {}, miniCards: {} };
   }
 }
 
@@ -62,6 +63,7 @@ function saveDB(db) {
 
 const db = loadDB();
 db.config.tierLabels ||= DEFAULT_TIER_LABELS;
+db.miniCards ||= {};
 saveDB(db);
 
 // ====== HELPERS ======
@@ -226,6 +228,94 @@ async function fetchReviewMessage(client, sub) {
   return msg;
 }
 
+
+// ====== MINI CARDS (SUBMIT CHANNEL) ======
+// Маленькие "карточки" в канале подачи (#elo-submit): кто сейчас в тир-листе.
+// Требование: очень компактно, без картинок, без полей.
+function buildMiniCardEmbed(rating) {
+  return new EmbedBuilder()
+    .setDescription(`✅ **${rating.name}** добавлен в тир-лист.`);
+}
+
+async function upsertMiniCardMessage(client, rating) {
+  if (!SUBMIT_CHANNEL_ID) return { changed: false };
+  const ch = await client.channels.fetch(SUBMIT_CHANNEL_ID).catch(() => null);
+  if (!ch?.isTextBased()) return { changed: false };
+
+  const embed = buildMiniCardEmbed(rating);
+  const existingId = (db.miniCards || {})[rating.userId];
+
+  if (existingId) {
+    try {
+      const msg = await ch.messages.fetch(existingId);
+      await msg.edit({ embeds: [embed] }).catch(() => {});
+      return { changed: false };
+    } catch {
+      // сообщение удалено/недоступно — пересоздадим
+      db.miniCards[rating.userId] = "";
+      saveDB(db);
+    }
+  }
+
+  const msg = await ch.send({ embeds: [embed] }).catch(() => null);
+  if (!msg) return { changed: false };
+
+  // можно закреплять, чтобы "висело" (если лимит закрепов — просто проигнорит)
+  try { await msg.pin(); } catch {}
+
+  db.miniCards[rating.userId] = msg.id;
+  saveDB(db);
+  return { changed: true };
+}
+
+async function deleteMiniCardMessage(client, userId) {
+  const msgId = (db.miniCards || {})[userId];
+  if (!msgId) {
+    if (db.miniCards && (userId in db.miniCards)) {
+      delete db.miniCards[userId];
+      saveDB(db);
+    }
+    return false;
+  }
+
+  const ch = await client.channels.fetch(SUBMIT_CHANNEL_ID).catch(() => null);
+  if (ch?.isTextBased()) {
+    const msg = await ch.messages.fetch(msgId).catch(() => null);
+    if (msg) await msg.delete().catch(() => {});
+  }
+
+  delete db.miniCards[userId];
+  saveDB(db);
+  return true;
+}
+
+async function syncMiniCards(client) {
+  db.miniCards ||= {};
+  const wantIds = new Set(Object.keys(db.ratings || {}));
+
+  let created = 0;
+  let removed = 0;
+
+  // создать/починить отсутствующие
+  for (const uid of wantIds) {
+    const r = db.ratings[uid];
+    if (!r) continue;
+    const had = Boolean(db.miniCards[uid]);
+    const res = await upsertMiniCardMessage(client, r);
+    if (!had && res.changed) created++;
+  }
+
+  // удалить лишние (кто уже не в тир-листе)
+  for (const uid of Object.keys(db.miniCards)) {
+    if (wantIds.has(uid)) continue;
+    const ok = await deleteMiniCardMessage(client, uid);
+    if (ok) removed++;
+  }
+
+  return { created, removed, total: wantIds.size };
+}
+
+
 // ====== TIERLIST INDEX ======
 async function ensureIndexMessage(client) {
   const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID);
@@ -369,6 +459,7 @@ function buildCommands() {
         .addStringOption(o => o.setName("t3").setDescription("Название тира 3").setRequired(true))
         .addStringOption(o => o.setName("t4").setDescription("Название тира 4").setRequired(true))
         .addStringOption(o => o.setName("t5").setDescription("Название тира 5").setRequired(true)))
+      .addSubcommand(s => s.setName("minicards").setDescription("Пересоздать мини-карточки в submit (модеры)"))
   ].map(c => c.toJSON());
 }
 
@@ -397,6 +488,7 @@ client.once("ready", async () => {
   await ensureIndexMessage(client);
   await updateIndex(client);
   await syncTierlistRolesOnStart(client);
+  await syncMiniCards(client);
 
   console.log("Ready");
 });
@@ -582,6 +674,17 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // /elo minicards
+    if (sub === "minicards") {
+      const res = await syncMiniCards(client);
+      await interaction.reply({
+        content: `Мини-карточки: создано ${res.created}, удалено ${res.removed}, всего в тир-листе ${res.total}.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+
     // /elo labels
     if (sub === "labels") {
       db.config.tierLabels = {
@@ -617,6 +720,7 @@ client.on("interactionCreate", async (interaction) => {
 
       delete db.ratings[target.id];
       saveDB(db);
+      await deleteMiniCardMessage(client, target.id);
       await updateIndex(client);
       await setTierlistRole(client, target.id, false, "Removed from tierlist");
 
@@ -649,6 +753,13 @@ client.on("interactionCreate", async (interaction) => {
       for (const uid of _wipeIds) {
         await setTierlistRole(client, uid, false, "Wipe ratings");
       }
+
+      // мини-карточки в submit должны пропасть, раз тир-лист очищен
+      const _miniIds = Object.keys(db.miniCards || {});
+      for (const uid of _miniIds) {
+        await deleteMiniCardMessage(client, uid);
+      }
+      db.miniCards = {};
 
       db.ratings = {};
       saveDB(db);
@@ -729,6 +840,7 @@ client.on("interactionCreate", async (interaction) => {
       saveDB(db);
       await updateIndex(client);
       await setTierlistRole(client, sub.userId, true, "Approved to tierlist");
+      await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён.", ephemeral: true });
