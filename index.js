@@ -28,7 +28,6 @@ const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID;
 const TIERLIST_CHANNEL_ID = process.env.TIERLIST_CHANNEL_ID;
 const MOD_ROLE_ID = process.env.MOD_ROLE_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "";
-const TIERLIST_ROLE_ID = process.env.TIERLIST_ROLE_ID || "";
 
 const SUBMIT_COOLDOWN_SECONDS = 120; // кулдаун на ВАЛИДНУЮ заявку
 const PENDING_EXPIRE_HOURS = 48;     // протухание pending
@@ -165,39 +164,82 @@ function isModerator(member) {
   return false;
 }
 
-// ====== ROLE: TIERLIST MEMBER ======
-let _tierlistGuildCache = null;
+// ====== ROLES: PER-TIER (RANK) ======
+// Раньше выдавалась одна роль "участник тир-листа" (TIERLIST_ROLE_ID).
+// Теперь: за КАЖДЫЙ тир/ранг выдаётся своя роль, и бот держит ровно одну из них.
+// Настройка через .env (любые можно оставить пустыми — тогда роли не трогаем):
+// TIER_ROLE_1_ID, TIER_ROLE_2_ID, TIER_ROLE_3_ID, TIER_ROLE_4_ID, TIER_ROLE_5_ID
+const TIER_ROLE_IDS = {
+  1: process.env.TIER_ROLE_1_ID || "",
+  2: process.env.TIER_ROLE_2_ID || "",
+  3: process.env.TIER_ROLE_3_ID || "",
+  4: process.env.TIER_ROLE_4_ID || "",
+  5: process.env.TIER_ROLE_5_ID || "",
+};
 
-async function getTierlistGuild(client) {
-  if (_tierlistGuildCache) return _tierlistGuildCache;
+let _guildCache = null;
+
+async function getGuild(client) {
+  if (_guildCache) return _guildCache;
   if (!GUILD_ID) return null;
-  _tierlistGuildCache = await client.guilds.fetch(GUILD_ID).catch(() => null);
-  return _tierlistGuildCache;
+  _guildCache = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  return _guildCache;
 }
 
-async function setTierlistRole(client, userId, shouldHave, reason = "tierlist") {
-  if (!TIERLIST_ROLE_ID) return;
-  const guild = await getTierlistGuild(client);
+function allTierRoleIds() {
+  return Object.values(TIER_ROLE_IDS).filter(Boolean);
+}
+
+async function ensureSingleTierRole(client, userId, targetTier, reason = "tier role sync") {
+  const targetRoleId = TIER_ROLE_IDS[targetTier] || "";
+  const all = allTierRoleIds();
+
+  // если роли не настроены — ничего не делаем
+  if (!all.length) return;
+
+  const guild = await getGuild(client);
   if (!guild) return;
 
   const member = await guild.members.fetch(userId).catch(() => null);
   if (!member) return;
 
-  const has = member.roles.cache.has(TIERLIST_ROLE_ID);
-  if (shouldHave && !has) {
-    await member.roles.add(TIERLIST_ROLE_ID, reason).catch(() => {});
-  } else if (!shouldHave && has) {
-    await member.roles.remove(TIERLIST_ROLE_ID, reason).catch(() => {});
+  // 1) снять все "не те" тир-роли
+  const toRemove = all.filter(rid => rid !== targetRoleId && member.roles.cache.has(rid));
+  for (const rid of toRemove) {
+    await member.roles.remove(rid, reason).catch(() => {});
+  }
+
+  // 2) надеть нужную (если она задана)
+  if (targetRoleId && !member.roles.cache.has(targetRoleId)) {
+    await member.roles.add(targetRoleId, reason).catch(() => {});
   }
 }
 
-async function syncTierlistRolesOnStart(client) {
-  if (!TIERLIST_ROLE_ID) return;
+async function clearAllTierRoles(client, userId, reason = "tier role clear") {
+  const all = allTierRoleIds();
+  if (!all.length) return;
+
+  const guild = await getGuild(client);
+  if (!guild) return;
+
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (!member) return;
+
+  for (const rid of all) {
+    if (member.roles.cache.has(rid)) {
+      await member.roles.remove(rid, reason).catch(() => {});
+    }
+  }
+}
+
+async function syncTierRolesOnStart(client) {
   const ids = Object.keys(db.ratings || {});
   if (!ids.length) return;
 
   for (const uid of ids) {
-    await setTierlistRole(client, uid, true, "sync from db");
+    const r = db.ratings[uid];
+    if (!r?.tier) continue;
+    await ensureSingleTierRole(client, uid, Number(r.tier), "sync from db");
   }
 }
 
@@ -487,7 +529,7 @@ client.once("ready", async () => {
 
   await ensureIndexMessage(client);
   await updateIndex(client);
-  await syncTierlistRolesOnStart(client);
+  await syncTierRolesOnStart(client);
   await syncMiniCards(client);
 
   console.log("Ready");
@@ -722,7 +764,7 @@ client.on("interactionCreate", async (interaction) => {
       saveDB(db);
       await deleteMiniCardMessage(client, target.id);
       await updateIndex(client);
-      await setTierlistRole(client, target.id, false, "Removed from tierlist");
+      await clearAllTierRoles(client, target.id, "Removed from tierlist");
 
       await interaction.reply({ content: `Удалил <@${target.id}> из тир-листа.`, ephemeral: true });
       return;
@@ -751,7 +793,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const _wipeIds = Object.keys(db.ratings || {});
       for (const uid of _wipeIds) {
-        await setTierlistRole(client, uid, false, "Wipe ratings");
+        await clearAllTierRoles(client, uid, "Wipe ratings");
       }
 
       // мини-карточки в submit должны пропасть, раз тир-лист очищен
@@ -839,7 +881,7 @@ client.on("interactionCreate", async (interaction) => {
       await upsertCardMessage(client, rating, interaction.user.tag);
       saveDB(db);
       await updateIndex(client);
-      await setTierlistRole(client, sub.userId, true, "Approved to tierlist");
+      await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
       await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
