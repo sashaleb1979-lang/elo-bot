@@ -1,1000 +1,2031 @@
 require("dotenv").config();
+
 const fs = require("fs");
 const path = require("path");
-const https = require("https");
-const http = require("http");
-
+const { PassThrough } = require("stream");
+const PImage = require("pureimage");
 const {
-  Client,
-  GatewayIntentBits,
-  EmbedBuilder,
-  AttachmentBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  PermissionsBitField,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
+Client,
+GatewayIntentBits,
+  AuditLogEvent,
   SlashCommandBuilder,
+ActionRowBuilder,
+ButtonBuilder,
+ButtonStyle,
+StringSelectMenuBuilder,
+EmbedBuilder,
+AttachmentBuilder,
+PermissionFlagsBits,
+ModalBuilder,
+TextInputBuilder,
+TextInputStyle
 } = require("discord.js");
 
-// ====== НАСТРОЙКИ ======
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+// -------------------- ENV --------------------
+const {
+  DISCORD_TOKEN,
+  GUILD_ID,
+  DEFAULT_CHANNEL_ID,
+  DASHBOARD_TITLE = "Tier List",
+  COOLDOWN_HOURS = "24",
+  DATA_DIR = "./data",
+  ADMIN_ROLE_IDS = "",
 
-const GUILD_ID = process.env.GUILD_ID;
-const SUBMIT_CHANNEL_ID = process.env.SUBMIT_CHANNEL_ID;
-const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID;
-const TIERLIST_CHANNEL_ID = process.env.TIERLIST_CHANNEL_ID;
-const MOD_ROLE_ID = process.env.MOD_ROLE_ID;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "";
+  // Influence roles (optional)
+  TIER_ROLE_1_ID = "",
+  TIER_ROLE_2_ID = "",
+  TIER_ROLE_3_ID = "",
+  TIER_ROLE_4_ID = "",
+  TIER_ROLE_5_ID = "",
 
-const SUBMIT_COOLDOWN_SECONDS = 120; // кулдаун на ВАЛИДНУЮ заявку
-const PENDING_EXPIRE_HOURS = 48;     // протухание pending
+  // Image tuning (defaults; can be overridden by /image set)
+  IMG_WIDTH = "2000",
+  IMG_HEIGHT = "1200",
+  ICON_SIZE = "112"
+} = process.env;
 
-// TODO: ВПИШИ СВОИ НАЗВАНИЯ ТИРОВ ТУТ (пока цифры)
-// (можно менять через /elo labels тоже)
-const DEFAULT_TIER_LABELS = { 1: "1", 2: "2", 3: "3", 4: "4", 5: "5" };
+if (!DISCORD_TOKEN || !GUILD_ID) {
+  console.error("Missing DISCORD_TOKEN or GUILD_ID in .env");
+  process.exit(1);
+}
 
-// ====== DB (файл) ======
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "db.json");
+const COOLDOWN_MS = Number(COOLDOWN_HOURS) * 60 * 60 * 1000;
+const ADMIN_ROLE_SET = new Set(
+  (ADMIN_ROLE_IDS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 
-function loadDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    return { config: {}, submissions: {}, ratings: {}, cooldowns: {}, miniCards: {} };
-  }
+// -------------------- INFLUENCE (ROLE-BASED) --------------------
+// Users can have special tier roles that increase how strongly their personal tier-list affects the global result.
+const ROLE_INFLUENCE = new Map([
+  [String(TIER_ROLE_1_ID || ""), 2.0],
+  [String(TIER_ROLE_2_ID || ""), 2.4],
+  [String(TIER_ROLE_3_ID || ""), 2.8],
+  [String(TIER_ROLE_4_ID || ""), 3.2],
+  [String(TIER_ROLE_5_ID || ""), 3.6]
+]);
+
+function resolveInfluenceFromMember(member) {
   try {
-    const data = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
-    data.config ||= {};
-    data.submissions ||= {};
-    data.ratings ||= {};
-    data.cooldowns ||= {};
-    data.miniCards ||= {};
-    return data;
+    const roles = member?.roles?.cache;
+    if (!roles) return { mult: 1, roleId: null };
+
+    let best = 1;
+    let bestRole = null;
+
+    for (const [rid, mult] of ROLE_INFLUENCE.entries()) {
+      if (!rid) continue;
+      if (roles.has(rid) && mult > best) {
+        best = mult;
+        bestRole = rid;
+      }
+    }
+    return { mult: best, roleId: bestRole };
   } catch {
-    return { config: {}, submissions: {}, ratings: {}, cooldowns: {}, miniCards: {} };
+    return { mult: 1, roleId: null };
   }
 }
 
-function saveDB(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+function getStoredInfluenceMultiplier(userId) {
+  const u = state.users?.[userId];
+  const mult = Number(u?.influenceMultiplier);
+  return Number.isFinite(mult) && mult > 0 ? mult : 1;
 }
 
-const db = loadDB();
-db.config.tierLabels ||= DEFAULT_TIER_LABELS;
-db.miniCards ||= {};
-saveDB(db);
+async function backfillInfluenceForExistingVoters(client, { refresh = true } = {}) {
+  // Updates influenceMultiplier for everyone who already has a final vote stored.
+  // This makes old (already submitted) votes start using role influence without users re-submitting.
+  const voterIds = Object.entries(state.finalVotes || {})
+    .filter(([uid, votes]) => votes && Object.keys(votes).length > 0)
+    .map(([uid]) => uid);
 
-// ====== HELPERS ======
-function makeId() {
-  return (Date.now().toString(36) + Math.random().toString(36).slice(2, 10)).toUpperCase();
-}
+  if (voterIds.length === 0) return { total: 0, changed: 0 };
 
-function parseElo(text) {
-  if (!text) return null;
-  const m = text.match(/(\d{1,4})\+?/);
-  if (!m) return null;
-  const n = Number(m[1]);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
-}
+  const guild = await client.guilds.fetch(GUILD_ID);
+  let changed = 0;
 
-function isImageAttachment(att) {
-  if (!att) return false;
-  const ct = att.contentType || "";
-  if (ct.startsWith("image/")) return true;
-  const url = (att.url || "").toLowerCase();
-  return url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp") || url.endsWith(".gif");
-}
+  for (const uid of voterIds) {
+    const member = await guild.members.fetch(uid).catch(() => null);
+    const inf = resolveInfluenceFromMember(member);
 
-// Тиры "ОТ": 15 / 35 / 60 / 90 / 120 (ниже 15 — невалидно)
-function tierFor(elo) {
-  if (elo >= 120) return 5;
-  if (elo >= 90) return 4;
-  if (elo >= 60) return 3;
-  if (elo >= 35) return 2;
-  if (elo >= 15) return 1;
-  return null;
-}
+    const u = getUser(uid);
+    const prev = Number(u.influenceMultiplier) || 1;
 
-function formatTierTitle(t) {
-  const labels = db.config.tierLabels || DEFAULT_TIER_LABELS;
-  // В тир-листе не добавляем префикс "Тир" перед кастомным названием.
-  return `${labels[t] ?? t}`;
-}
-
-function sanitizeFileName(name, fallbackExt = "png") {
-  const base = (name || "")
-    .replace(/[^a-zA-Z0-9._-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
-
-  if (!base) return `screenshot.${fallbackExt}`;
-  // Если нет расширения — добавим.
-  if (!/\.[a-z0-9]{2,5}$/i.test(base)) return `${base}.${fallbackExt}`;
-  return base;
-}
-
-async function downloadToBuffer(url, timeoutMs = 15000) {
-  // 1) Node 18+: используем fetch
-  if (typeof fetch === "function") {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, { signal: controller.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const ab = await res.arrayBuffer();
-      return Buffer.from(ab);
-    } finally {
-      clearTimeout(t);
+    if (prev !== inf.mult || (u.influenceRoleId || null) !== (inf.roleId || null)) {
+      u.influenceMultiplier = inf.mult;
+      u.influenceRoleId = inf.roleId;
+      u.influenceUpdatedAt = Date.now();
+      changed++;
     }
   }
 
-  // 2) Fallback (Node 16/17): качаем через http/https
-  return await new Promise((resolve, reject) => {
-    const lib = url.startsWith("https:") ? https : http;
-    const req = lib.get(url, (res) => {
-      // редиректы
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        downloadToBuffer(res.headers.location, timeoutMs).then(resolve).catch(reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        res.resume();
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
-      }
+  if (changed > 0) saveState(state);
 
-      const chunks = [];
-      res.on("data", (d) => chunks.push(d));
-      res.on("end", () => resolve(Buffer.concat(chunks)));
-    });
-    req.on("error", reject);
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error("timeout"));
-    });
-  });
+  const hasDashboard = Boolean(state.settings?.channelId && state.settings?.dashboardMessageId);
+  if (refresh && changed > 0 && hasDashboard) {
+    await refreshDashboard(client).catch(() => {});
+  }
+
+  return { total: voterIds.length, changed };
 }
 
-function isModerator(member) {
-  if (!member) return false;
-  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
-  if (MOD_ROLE_ID && member.roles?.cache?.has(MOD_ROLE_ID)) return true;
+// -------------------- PATHS --------------------
+const CONFIG_DIR = path.join(__dirname, "config");
+const ASSETS_DIR = path.join(__dirname, "assets");
+
+const CHARACTERS_PATH = path.join(CONFIG_DIR, "characters.json");
+const TIERS_DEFAULT_PATH = path.join(CONFIG_DIR, "tiers.default.json");
+
+const STATE_DIR = path.resolve(__dirname, DATA_DIR);
+const STATE_PATH = path.join(STATE_DIR, "state.json");
+
+function ensureDir(p) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+function loadJson(p) {
+  return JSON.parse(fs.readFileSync(p, "utf-8"));
+}
+
+const characters = loadJson(CHARACTERS_PATH).filter(c => c.enabled);
+const charById = new Map(characters.map(c => [c.id, c]));
+const tierDefaults = loadJson(TIERS_DEFAULT_PATH);
+
+// -------------------- STATE --------------------
+function defaultState() {
+  return {
+    settings: {
+      guildId: GUILD_ID,
+      channelId: DEFAULT_CHANNEL_ID || null,
+      dashboardMessageId: null,
+      lastUpdated: 0,
+      image: {
+        width: null,
+        height: null,
+        icon: null
+      }
+    },
+    tiers: tierDefaults,
+    users: {
+      // userId: { mainId, lockUntil, wizQueue, wizIndex }
+    },
+    draftVotes: {
+      // userId: { characterId: "S|A|B|C|D" }
+    },
+    finalVotes: {
+      // userId: { characterId: "S|A|B|C|D" }
+    }
+  };
+}
+
+function loadState() {
+  ensureDir(STATE_DIR);
+  if (!fs.existsSync(STATE_PATH)) {
+    const st = defaultState();
+    saveState(st);
+    return st;
+  }
+  try {
+    const st = JSON.parse(fs.readFileSync(STATE_PATH, "utf-8"));
+    const def = defaultState();
+    st.settings ||= def.settings;
+    st.settings.image ||= def.settings.image;
+    st.tiers ||= tierDefaults;
+    st.users ||= {};
+    st.draftVotes ||= {};
+    st.finalVotes ||= {};
+    return st;
+  } catch {
+    const st = defaultState();
+    saveState(st);
+    return st;
+  }
+}
+
+function saveState(st) {
+  ensureDir(STATE_DIR);
+  const tmp = STATE_PATH + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(st, null, 2), "utf-8");
+  fs.renameSync(tmp, STATE_PATH);
+}
+
+let state = loadState();
+
+// -------------------- MOD CHECK --------------------
+function isModerator(interaction) {
+  if (!interaction.inGuild()) return false;
+  const member = interaction.member;
+  if (member.permissions?.has(PermissionFlagsBits.ManageGuild)) return true;
+  if (ADMIN_ROLE_SET.size === 0) return false;
+  const roles = member.roles?.cache;
+  if (!roles) return false;
+  for (const rid of ADMIN_ROLE_SET) if (roles.has(rid)) return true;
   return false;
 }
 
-// ====== ROLES: PER-TIER (RANK) ======
-// Раньше выдавалась одна роль "участник тир-листа" (TIERLIST_ROLE_ID).
-// Теперь: за КАЖДЫЙ тир/ранг выдаётся своя роль, и бот держит ровно одну из них.
-// Настройка через .env (любые можно оставить пустыми — тогда роли не трогаем):
-// TIER_ROLE_1_ID, TIER_ROLE_2_ID, TIER_ROLE_3_ID, TIER_ROLE_4_ID, TIER_ROLE_5_ID
-const TIER_ROLE_IDS = {
-  1: process.env.TIER_ROLE_1_ID || "",
-  2: process.env.TIER_ROLE_2_ID || "",
-  3: process.env.TIER_ROLE_3_ID || "",
-  4: process.env.TIER_ROLE_4_ID || "",
-  5: process.env.TIER_ROLE_5_ID || "",
-};
+// -------------------- TIERS --------------------
+const TIER_ORDER = ["S", "A", "B", "C", "D"];
+const TIER_OFFSET = { S: +2, A: +1, B: 0, C: -1, D: -2 };
 
-let _guildCache = null;
-
-async function getGuild(client) {
-  if (_guildCache) return _guildCache;
-  if (!GUILD_ID) return null;
-  _guildCache = await client.guilds.fetch(GUILD_ID).catch(() => null);
-  return _guildCache;
+function voteWeight(tierKey) {
+  const off = Math.abs(TIER_OFFSET[tierKey]);
+  return off === 2 ? 5 : 1;
 }
 
-function allTierRoleIds() {
-  return Object.values(TIER_ROLE_IDS).filter(Boolean);
+// prior: one virtual B vote
+function computeCharacterAvgOffset(characterId) {
+  let sum = 0;
+  let wsum = 1;
+
+  for (const [uid, votes] of Object.entries(state.finalVotes)) {
+    const t = votes?.[characterId];
+    if (!t) continue;
+
+    const mult = getStoredInfluenceMultiplier(uid);
+    const w = voteWeight(t) * mult;
+
+    sum += TIER_OFFSET[t] * w;
+    wsum += w;
+  }
+  return sum / wsum;
 }
 
-async function ensureSingleTierRole(client, userId, targetTier, reason = "tier role sync") {
-  const targetRoleId = TIER_ROLE_IDS[targetTier] || "";
-  const all = allTierRoleIds();
+function avgToTier(avg) {
+  if (avg >= 1.5) return "S";
+  if (avg >= 0.5) return "A";
+  if (avg > -0.5) return "B";
+  if (avg > -1.5) return "C";
+  return "D";
+}
 
-  // если роли не настроены — ничего не делаем
-  if (!all.length) return;
+function computeGlobalBuckets() {
+  const buckets = { S: [], A: [], B: [], C: [], D: [] };
+  const meta = {};
+  const voters = new Set();
 
-  const guild = await getGuild(client);
-  if (!guild) return;
-
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member) return;
-
-  // 1) снять все "не те" тир-роли
-  const toRemove = all.filter(rid => rid !== targetRoleId && member.roles.cache.has(rid));
-  for (const rid of toRemove) {
-    await member.roles.remove(rid, reason).catch(() => {});
+  for (const [uid, votes] of Object.entries(state.finalVotes)) {
+    if (votes && Object.keys(votes).length > 0) voters.add(uid);
   }
 
-  // 2) надеть нужную (если она задана)
-  if (targetRoleId && !member.roles.cache.has(targetRoleId)) {
-    await member.roles.add(targetRoleId, reason).catch(() => {});
-  }
-}
-
-async function clearAllTierRoles(client, userId, reason = "tier role clear") {
-  const all = allTierRoleIds();
-  if (!all.length) return;
-
-  const guild = await getGuild(client);
-  if (!guild) return;
-
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member) return;
-
-  for (const rid of all) {
-    if (member.roles.cache.has(rid)) {
-      await member.roles.remove(rid, reason).catch(() => {});
+  for (const c of characters) {
+    let votesCount = 0;
+    for (const votes of Object.values(state.finalVotes)) {
+      if (votes?.[c.id]) votesCount++;
     }
+    const avg = computeCharacterAvgOffset(c.id);
+    const tier = avgToTier(avg);
+    buckets[tier].push(c.id);
+    meta[c.id] = { avg, votes: votesCount, name: (charById.get(c.id)?.name || c.id) };
   }
-}
 
-async function syncTierRolesOnStart(client) {
-  const ids = Object.keys(db.ratings || {});
-  if (!ids.length) return;
-
-  for (const uid of ids) {
-    const r = db.ratings[uid];
-    if (!r?.tier) continue;
-    await ensureSingleTierRole(client, uid, Number(r.tier), "sync from db");
+  // Sort inside tiers: avg desc, votes desc, name asc (stable feeling)
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => {
+      const A = meta[a];
+      const B = meta[b];
+      if (B.avg !== A.avg) return B.avg - A.avg;
+      if (B.votes !== A.votes) return B.votes - A.votes;
+      return String(A.name).localeCompare(String(B.name), "ru");
+    });
   }
+
+  return { buckets, votersCount: voters.size };
 }
 
-function hoursSince(iso) {
-  const t = Date.parse(iso);
-  if (!Number.isFinite(t)) return 999999;
-  return (Date.now() - t) / 36e5;
+
+// -------------------- USER BUCKETS (for panel view + my_status) --------------------
+function normalizeTierKey(t) {
+  return TIER_OFFSET.hasOwnProperty(t) ? t : "B";
 }
 
-async function logLine(client, text) {
-  if (!LOG_CHANNEL_ID) return;
-  const ch = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-  if (ch?.isTextBased()) await ch.send(text).catch(() => {});
+function buildBucketsFromVoteMap(voteMap) {
+  const buckets = { S: [], A: [], B: [], C: [], D: [] };
+  for (const c of characters) {
+    const t = normalizeTierKey(voteMap?.[c.id]);
+    buckets[t].push(c.id);
+  }
+  // Sort like global feel: by global avg desc, then name asc
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => {
+      const av = computeCharacterAvgOffset(a);
+      const bv = computeCharacterAvgOffset(b);
+      if (bv !== av) return bv - av;
+      const an = charById.get(a)?.name || a;
+      const bn = charById.get(b)?.name || b;
+      return String(an).localeCompare(String(bn), "ru");
+    });
+  }
+  return buckets;
 }
 
-async function dmUser(client, userId, text) {
+async function renderUserFinalTierlistPng(targetUserId, titleSuffix) {
+  const votes = state.finalVotes?.[targetUserId] || {};
+  const tu = state.users?.[targetUserId] || {};
+  const mainId = tu.mainId || null;
+
+  const buckets = buildBucketsFromVoteMap(votes);
+  const updated = new Date().toLocaleString("ru-RU");
+
+  return renderTierlistFromBuckets({
+    title: `${DASHBOARD_TITLE}${titleSuffix ? " " + titleSuffix : ""}`,
+    footerText: `user: ${targetUserId}. updated: ${updated}`,
+    buckets,
+    lockedId: mainId
+  });
+}
+
+// -------------------- IMAGE CONFIG --------------------
+function getImageConfig() {
+  const cfg = state.settings?.image || {};
+  const w = Number(cfg.width) || Number(IMG_WIDTH) || 2000;
+  const h = Number(cfg.height) || Number(IMG_HEIGHT) || 1200;
+  const icon = Number(cfg.icon) || Number(ICON_SIZE) || 112;
+  return {
+    W: Math.max(1200, w),
+    H: Math.max(700, h),
+    ICON: Math.max(64, icon)
+  };
+}
+
+// -------------------- FONTS (FIX FOR "NO TEXT") --------------------
+// Your repo has assets/fonts/montserrat-bold.ttf, but earlier code expected NotoSans*.ttf.
+// This loader will auto-detect any .ttf in assets/fonts and use it as fallback.
+let fontsReady = false;
+let FONT_REG = "AppFont";
+let FONT_BOLD = "AppFontBold";
+let FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false };
+
+function listTtfFiles() {
+  const dir = path.join(ASSETS_DIR, "fonts");
   try {
-    const user = await client.users.fetch(userId);
-    await user.send(text);
-  } catch {}
+    if (!fs.existsSync(dir)) return [];
+    return fs.readdirSync(dir)
+      .filter(f => f.toLowerCase().endsWith(".ttf"))
+      .map(f => path.join(dir, f));
+  } catch {
+    return [];
+  }
 }
 
-async function fetchReviewMessage(client, sub) {
-  if (!sub.reviewChannelId || !sub.reviewMessageId) return null;
-  const ch = await client.channels.fetch(sub.reviewChannelId).catch(() => null);
-  if (!ch?.isTextBased()) return null;
-  const msg = await ch.messages.fetch(sub.reviewMessageId).catch(() => null);
-  return msg;
+function pickFontFiles() {
+  const dir = path.join(ASSETS_DIR, "fonts");
+  const notoReg = path.join(dir, "NotoSans-Regular.ttf");
+  const notoBold = path.join(dir, "NotoSans-Bold.ttf");
+
+  if (fs.existsSync(notoReg) && fs.existsSync(notoBold)) {
+    return { regularFile: notoReg, boldFile: notoBold, usedFallback: false };
+  }
+
+  const mont = path.join(dir, "montserrat-bold.ttf");
+  if (fs.existsSync(mont)) {
+    // Use same file for both to guarantee text renders
+    return { regularFile: mont, boldFile: mont, usedFallback: true };
+  }
+
+  const any = listTtfFiles();
+  if (any.length > 0) {
+    return { regularFile: any[0], boldFile: any[0], usedFallback: true };
+  }
+
+  return { regularFile: null, boldFile: null, usedFallback: true };
 }
 
+function tryRegisterFonts() {
+  if (fontsReady) return;
 
-// ====== MINI CARDS (SUBMIT CHANNEL) ======
-// Маленькие "карточки" в канале подачи (#elo-submit): кто сейчас в тир-листе.
-// Требование: очень компактно, без картинок, без полей.
-function buildMiniCardEmbed(rating) {
-  return new EmbedBuilder()
-    .setDescription(`✅ **${rating.name}** добавлен в тир-лист.`);
+  const picked = pickFontFiles();
+  FONT_INFO = picked;
+
+  try {
+    if (picked.regularFile) PImage.registerFont(picked.regularFile, FONT_REG).loadSync();
+    if (picked.boldFile) PImage.registerFont(picked.boldFile, FONT_BOLD).loadSync();
+  } catch {
+    // ignore (we'll still proceed; but most likely text won't render without fonts)
+  } finally {
+    fontsReady = true;
+  }
 }
 
-async function upsertMiniCardMessage(client, rating) {
-  if (!SUBMIT_CHANNEL_ID) return { changed: false };
-  const ch = await client.channels.fetch(SUBMIT_CHANNEL_ID).catch(() => null);
-  if (!ch?.isTextBased()) return { changed: false };
+// -------------------- IMAGE RENDER --------------------
+const iconCache = new Map();
 
-  const embed = buildMiniCardEmbed(rating);
-  const existingId = (db.miniCards || {})[rating.userId];
+async function loadIcon(characterId) {
+  if (iconCache.has(characterId)) return iconCache.get(characterId);
 
-  if (existingId) {
-    try {
-      const msg = await ch.messages.fetch(existingId);
-      await msg.edit({ embeds: [embed] }).catch(() => {});
-      return { changed: false };
-    } catch {
-      // сообщение удалено/недоступно — пересоздадим
-      db.miniCards[rating.userId] = "";
-      saveDB(db);
+  const p = path.join(ASSETS_DIR, "characters", `${characterId}.png`);
+  if (!fs.existsSync(p)) {
+    iconCache.set(characterId, null);
+    return null;
+  }
+  try {
+    const img = await PImage.decodePNGFromStream(fs.createReadStream(p));
+    iconCache.set(characterId, img);
+    return img;
+  } catch {
+    iconCache.set(characterId, null);
+    return null;
+  }
+}
+
+function hexToRgb(hex) {
+  const h = (hex || "#cccccc").replace("#", "");
+  const n = parseInt(h, 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+function fill(ctx, hex) {
+  const { r, g, b } = hexToRgb(hex);
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+}
+
+async function renderTierlistFromBuckets({
+  title,
+  footerText,
+  buckets,
+  lockedId = null,
+  highlightId = null
+}) {
+  tryRegisterFonts();
+  const { W, H: H_CFG, ICON } = getImageConfig();
+
+  // Layout constants
+  const topY = 110;
+  const rows = 5;
+  const leftW = Math.floor(W * 0.24);
+  const rightPadding = 36;
+
+  // Dynamic wrapping math (so tiers can grow downward when icons are big)
+  const gap = Math.max(10, Math.floor(ICON * 0.16));
+  const rightW = W - leftW - rightPadding - 24;
+  const cols = Math.max(1, Math.floor((rightW + gap) / (ICON + gap)));
+
+  const rowHeights = TIER_ORDER.map((tierKey) => {
+    const n = (buckets[tierKey] || []).length;
+    const rowsNeeded = Math.max(1, Math.ceil(n / cols));
+    const iconsH = rowsNeeded * (ICON + gap) - gap;
+    const needed = 18 + iconsH + 22 + 12; // top pad + grid + bottom pad + panel padding
+    return Math.max(needed, 160); // minimum so left label text fits
+  });
+
+  const footerH = 44;
+  const neededH = topY + rowHeights.reduce((a, b) => a + b, 0) + footerH;
+  const H = Math.max(H_CFG, neededH);
+
+  const img = PImage.make(W, H);
+  const ctx = img.getContext("2d");
+
+  fill(ctx, "#242424");
+  ctx.fillRect(0, 0, W, H);
+
+  // Title
+  fill(ctx, "#ffffff");
+  ctx.font = `64px '${FONT_BOLD}'`;
+  ctx.fillText(title, 40, 82);
+
+  // Footer
+  fill(ctx, "#cfcfcf");
+  ctx.font = `22px '${FONT_REG}'`;
+  ctx.fillText(footerText, 40, H - 18);
+
+  let yCursor = topY;
+
+  for (let i = 0; i < rows; i++) {
+    const tierKey = TIER_ORDER[i];
+    const y = yCursor;
+    const rowH = rowHeights[i];
+    yCursor += rowH;
+
+    // Right panel background
+    fill(ctx, "#2f2f2f");
+    ctx.fillRect(leftW, y, W - leftW - rightPadding, rowH - 12);
+
+    // Left label block
+    const tierColor = state.tiers?.[tierKey]?.color || "#cccccc";
+    fill(ctx, tierColor);
+    ctx.fillRect(40, y, leftW - 40, rowH - 12);
+
+    // Tier label
+    const tierName = state.tiers?.[tierKey]?.name || tierKey;
+    const blockH = rowH - 12;
+
+    fill(ctx, "#111111");
+    ctx.font = `56px '${FONT_BOLD}'`;
+    ctx.fillText(tierName, 40 + 70, y + Math.floor(blockH / 2) + 18);
+
+    fill(ctx, "#111111");
+    ctx.font = `24px '${FONT_REG}'`;
+    ctx.fillText(tierKey, 40 + 70, y + blockH - 18);
+
+    // Icons layout (wraps to next line; tier row grows if needed)
+    const list = buckets[tierKey] || [];
+    const rightX = leftW + 24;
+    const rightY = y + 18;
+
+    for (let idx = 0; idx < list.length; idx++) {
+      const cid = list[idx];
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+      const x = rightX + col * (ICON + gap);
+      const yy = rightY + row * (ICON + gap);
+
+      const icon = await loadIcon(cid);
+
+      // frame
+      fill(ctx, "#171717");
+      ctx.fillRect(x - 3, yy - 3, ICON + 6, ICON + 6);
+
+      // highlight
+      if (highlightId && cid === highlightId) {
+        ctx.strokeStyle = "rgba(255,255,255,0.95)";
+        ctx.lineWidth = 6;
+        ctx.strokeRect(x - 5, yy - 5, ICON + 10, ICON + 10);
+      }
+
+      if (icon) {
+        ctx.drawImage(icon, x, yy, ICON, ICON);
+      } else {
+        fill(ctx, "#555555");
+        ctx.fillRect(x, yy, ICON, ICON);
+      }
+
+      // locked main overlay
+      if (lockedId && cid === lockedId) {
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(x, yy, ICON, ICON);
+        ctx.fillStyle = "rgba(230,230,230,0.95)";
+        ctx.font = `22px '${FONT_BOLD}'`;
+        ctx.fillText("MAIN", x + 10, yy + 32);
+      }
     }
   }
 
-  const msg = await ch.send({ embeds: [embed] }).catch(() => null);
-  if (!msg) return { changed: false };
-
-  // можно закреплять, чтобы "висело" (если лимит закрепов — просто проигнорит)
-  try { await msg.pin(); } catch {}
-
-  db.miniCards[rating.userId] = msg.id;
-  saveDB(db);
-  return { changed: true };
+// encode to buffer
+  const chunks = [];
+  const stream = new PassThrough();
+  stream.on("data", c => chunks.push(c));
+  await PImage.encodePNGToStream(img, stream);
+  stream.end();
+  return Buffer.concat(chunks);
 }
 
-async function deleteMiniCardMessage(client, userId) {
-  const msgId = (db.miniCards || {})[userId];
-  if (!msgId) {
-    if (db.miniCards && (userId in db.miniCards)) {
-      delete db.miniCards[userId];
-      saveDB(db);
-    }
-    return false;
-  }
-
-  const ch = await client.channels.fetch(SUBMIT_CHANNEL_ID).catch(() => null);
-  if (ch?.isTextBased()) {
-    const msg = await ch.messages.fetch(msgId).catch(() => null);
-    if (msg) await msg.delete().catch(() => {});
-  }
-
-  delete db.miniCards[userId];
-  saveDB(db);
-  return true;
+async function renderGlobalTierlistPng() {
+  const { buckets, votersCount } = computeGlobalBuckets();
+  const updated = new Date().toLocaleString("ru-RU");
+  return renderTierlistFromBuckets({
+    title: DASHBOARD_TITLE,
+    footerText: `voters: ${votersCount}. updated: ${updated}`,
+    buckets
+  });
 }
 
-async function syncMiniCards(client) {
-  db.miniCards ||= {};
-  const wantIds = new Set(Object.keys(db.ratings || {}));
+function computeDraftBuckets(userId) {
+  const u = getUser(userId);
+  const d = getDraft(userId);
 
-  let created = 0;
-  let removed = 0;
-
-  // создать/починить отсутствующие
-  for (const uid of wantIds) {
-    const r = db.ratings[uid];
-    if (!r) continue;
-    const had = Boolean(db.miniCards[uid]);
-    const res = await upsertMiniCardMessage(client, r);
-    if (!had && res.changed) created++;
+  const buckets = { S: [], A: [], B: [], C: [], D: [] };
+  for (const c of characters) {
+    const t = (d[c.id] && TIER_OFFSET[d[c.id]] !== undefined) ? d[c.id] : "B";
+    buckets[t].push(c.id);
   }
 
-  // удалить лишние (кто уже не в тир-листе)
-  for (const uid of Object.keys(db.miniCards)) {
-    if (wantIds.has(uid)) continue;
-    const ok = await deleteMiniCardMessage(client, uid);
-    if (ok) removed++;
+  for (const k of Object.keys(buckets)) {
+    buckets[k].sort((a, b) => (charById.get(a)?.name || a).localeCompare(charById.get(b)?.name || b));
   }
 
-  return { created, removed, total: wantIds.size };
+  return buckets;
 }
 
-
-// ====== TIERLIST INDEX ======
-async function ensureIndexMessage(client) {
-  const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) throw new Error("TIERLIST_CHANNEL_ID: не текстовый канал");
-
-  if (db.config.indexMessageId) {
-    try {
-      const msg = await channel.messages.fetch(db.config.indexMessageId);
-      if (msg) return msg;
-    } catch {}
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("ТИР-СПИСОК (авто)")
-    .setDescription("Пока пусто.");
-
-  const msg = await channel.send({ embeds: [embed] });
-  try { await msg.pin(); } catch {}
-  db.config.indexMessageId = msg.id;
-  saveDB(db);
-  return msg;
+async function renderDraftPreviewPng(userId, highlightId) {
+  const u = getUser(userId);
+  const buckets = computeDraftBuckets(userId);
+  const total = u.wizQueue?.length || 0;
+  const idx = Math.min(u.wizIndex || 0, total);
+  const updated = new Date().toLocaleTimeString("ru-RU");
+  return renderTierlistFromBuckets({
+    title: `${DASHBOARD_TITLE} (твоя оценка)`,
+    footerText: `progress: ${Math.min(idx, total)}/${total}. ${updated}`,
+    buckets,
+    lockedId: u.mainId || null,
+    highlightId: highlightId || null
+  });
 }
 
-function buildIndexEmbed() {
-  const entries = Object.values(db.ratings);
-  const tiers = { 1: [], 2: [], 3: [], 4: [], 5: [] };
-
-  for (const r of entries) {
-    const t = Number(r.tier);
-    if (tiers[t]) tiers[t].push(r);
-  }
-
-  for (const t of Object.keys(tiers)) {
-    tiers[t].sort((a, b) => (b.elo || 0) - (a.elo || 0));
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("ТИР-СПИСОК (авто)")
-    .setFooter({ text: "Подача: #elo-submit • Проверка: #elo-review" });
-
-  for (const t of [5, 4, 3, 2, 1]) {
-    const list = tiers[t];
-    if (!list.length) {
-      embed.addFields({ name: formatTierTitle(t), value: "—", inline: false });
-      continue;
-    }
-    const lines = list.slice(0, 50).map((r, i) => `${i + 1}. <@${r.userId}> (${r.name}) — **${r.elo}**`);
-    embed.addFields({ name: formatTierTitle(t), value: lines.join("\n"), inline: false });
-  }
-
-  return embed;
+// -------------------- USER HELPERS --------------------
+function formatTime(ts) {
+  return new Date(ts).toLocaleString("ru-RU");
 }
 
-async function updateIndex(client) {
-  const indexMsg = await ensureIndexMessage(client);
-  await indexMsg.edit({ embeds: [buildIndexEmbed()] });
+function getUser(userId) {
+  state.users[userId] ||= { mainId: null, lockUntil: 0, lastSubmitAt: 0, wizQueue: null, wizIndex: 0, influenceMultiplier: 1, influenceRoleId: null, influenceUpdatedAt: 0, panelTierKey: "S", panelTab: "config", panelParticipantsPage: 0, panelParticipantId: null, panelDeleteTargetId: null, panelDeleteMode: null };
+
+  const u = state.users[userId];
+  if (u.lastSubmitAt == null) u.lastSubmitAt = 0;
+  if (!u.panelTierKey) u.panelTierKey = "S";
+  if (!u.panelTab) u.panelTab = "config";
+  if (u.panelParticipantsPage == null) u.panelParticipantsPage = 0;
+  if (u.panelParticipantId == null) u.panelParticipantId = null;
+
+  return u;
+}
+function getDraft(userId) {
+  state.draftVotes[userId] ||= {};
+  return state.draftVotes[userId];
+}
+function getFinal(userId) {
+  state.finalVotes[userId] ||= {};
+  return state.finalVotes[userId];
 }
 
-async function upsertCardMessage(client, rating, approvedByTag) {
-  const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) return;
+function isLocked(userId) {
+  const u = getUser(userId);
+  return u.lockUntil && Date.now() < u.lockUntil;
+}
 
-  const embed = new EmbedBuilder()
-    .setAuthor({
-      name: `${rating.name} • ${formatTierTitle(rating.tier)}`,
-      iconURL: rating.avatarUrl || undefined,
-    })
-    .setTitle(`ELO: ${rating.elo}`)
-    .addFields(
-      { name: "Тир", value: `**${rating.tier}**`, inline: true },
-      { name: "ELO", value: `**${rating.elo}**`, inline: true },
-      { name: "Пруф", value: rating.proofUrl ? `[скрин](${rating.proofUrl})` : "—", inline: true }
-    )
-    .setFooter({ text: `Approved by ${approvedByTag}` });
+function setMain(userId, mainId) {
+  const u = getUser(userId);
+  u.mainId = mainId;
 
-  if (rating.proofUrl) embed.setImage(rating.proofUrl);
+  // remove main from draft/final if present
+  const d = getDraft(userId);
+  if (d[mainId]) delete d[mainId];
+  const f = getFinal(userId);
+  if (f[mainId]) delete f[mainId];
+}
 
-  if (rating.cardMessageId) {
-    try {
-      const msg = await channel.messages.fetch(rating.cardMessageId);
-      await msg.edit({ embeds: [embed] });
-      return;
-    } catch {
-      rating.cardMessageId = "";
-    }
+function startWizard(userId) {
+  const u = getUser(userId);
+  state.draftVotes[userId] = {};
+  u.wizQueue = characters.map(c => c.id).filter(cid => cid !== u.mainId);
+  u.wizIndex = 0;
+}
+
+function currentWizardChar(userId) {
+  const u = getUser(userId);
+  const q = u.wizQueue || [];
+  const idx = Math.max(0, Math.min(u.wizIndex || 0, q.length));
+  return q[idx] || null;
+}
+
+function wizardDone(userId) {
+  const u = getUser(userId);
+  const q = u.wizQueue || [];
+  return (u.wizIndex || 0) >= q.length;
+}
+
+function setDraftTier(userId, cid, tierKey) {
+  const u = getUser(userId);
+  if (!cid) return;
+  if (cid === u.mainId) return;
+  if (!TIER_OFFSET.hasOwnProperty(tierKey)) return;
+  const d = getDraft(userId);
+  d[cid] = tierKey;
+}
+
+function wizardNext(userId) {
+  const u = getUser(userId);
+  const q = u.wizQueue || [];
+  u.wizIndex = Math.min((u.wizIndex || 0) + 1, q.length);
+}
+
+function wizardBack(userId) {
+  const u = getUser(userId);
+  u.wizIndex = Math.max((u.wizIndex || 0) - 1, 0);
+}
+
+function submitWizardVotes(userId) {
+  const u = getUser(userId);
+  const q = u.wizQueue || [];
+  const d = getDraft(userId);
+  const f = getFinal(userId);
+
+  for (const cid of q) {
+    const t = (d[cid] && TIER_OFFSET[d[cid]] !== undefined) ? d[cid] : "B";
+    f[cid] = t;
   }
-
-  const msg = await channel.send({ embeds: [embed] });
-  rating.cardMessageId = msg.id;
+  if (u.mainId && f[u.mainId]) delete f[u.mainId];
 }
 
-// ====== REVIEW UI ======
-function buildReviewEmbed(sub, statusLabel, extraFields = []) {
+function lockUser(userId) {
+  const u = getUser(userId);
+  u.lockUntil = Date.now() + COOLDOWN_MS;
+}
+
+// -------------------- UI BUILDERS --------------------
+function buildMainSelect(userId) {
+  const u = getUser(userId);
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("select_main")
+    .setPlaceholder("Выбери своего main (обязательно)")
+    .setMinValues(1)
+    .setMaxValues(1);
+
+  for (const c of characters) {
+    menu.addOptions({
+      label: c.name,
+      value: c.id,
+      default: u.mainId === c.id
+    });
+  }
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function buildStartButtons(userId) {
+  const u = getUser(userId);
+  const row = new ActionRowBuilder();
+  if (u.mainId) {
+    const nm = charById.get(u.mainId)?.name || u.mainId;
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId("wiz_use_current_main")
+        .setLabel(`Продолжить с main: ${nm}`.slice(0, 80))
+        .setStyle(ButtonStyle.Primary)
+    );
+  }
+  row.addComponents(
+    new ButtonBuilder().setCustomId("wiz_cancel").setLabel("Закрыть").setStyle(ButtonStyle.Secondary)
+  );
+  return row;
+}
+
+function buildTierButtons(disabled = false) {
+  const make = (k) =>
+    new ButtonBuilder()
+      .setCustomId(`wiz_rate_${k}`)
+      .setLabel(`${k}`)
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(disabled);
+
+  return new ActionRowBuilder().addComponents(make("S"), make("A"), make("B"), make("C"), make("D"));
+}
+
+function buildWizardNavRow(userId) {
+  const u = getUser(userId);
+  const backDisabled = (u.wizIndex || 0) <= 0;
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("wiz_back").setLabel("Назад").setStyle(ButtonStyle.Secondary).setDisabled(backDisabled),
+    new ButtonBuilder().setCustomId("wiz_cancel").setLabel("Закрыть").setStyle(ButtonStyle.Danger)
+  );
+
+  if (wizardDone(userId)) {
+    row.addComponents(new ButtonBuilder().setCustomId("wiz_submit").setLabel("Отправить").setStyle(ButtonStyle.Success));
+  }
+  return row;
+}
+
+function buildStartEmbed(userId) {
+  const u = getUser(userId);
+  const locked = isLocked(userId);
+  const main = u.mainId ? (charById.get(u.mainId)?.name || u.mainId) : "не выбран";
+
   const e = new EmbedBuilder()
-    .setTitle(`ELO заявка (${statusLabel})`)
+    .setTitle("Оценка персонажей")
     .setDescription(
-      `Игрок: <@${sub.userId}> (${sub.name})\n` +
-      `ELO: **${sub.elo}**\n` +
-      `Тир (по числу): **${sub.tier}**\n` +
-      `Сообщение: [link](${sub.messageUrl})\n` +
-      `ID: \`${sub.id}\``
+      [
+        "1) выбери своего main.",
+        "2) появится твой личный тир-лист.",
+        "3) оценивай персонажей по одному кнопками S A B C D.",
+        "main будет серым и заблокированным."
+      ].join("\n")
     )
-    // Главное: в review показываем через attachment://..., если мы перезалили файл.
-    .setImage(sub.reviewImage || sub.screenshotUrl);
+    .addFields({ name: "Main", value: `**${main}**`, inline: true });
 
-  if (extraFields.length) e.addFields(...extraFields);
+  if (locked) e.addFields({ name: "Кулдаун", value: `До **${formatTime(u.lockUntil)}**`, inline: false });
+  else e.addFields({ name: "Кулдаун", value: "Можно отправлять сейчас.", inline: false });
+
   return e;
 }
 
-function buildReviewButtons(subId) {
+async function buildWizardPayload(userId) {
+  const u = getUser(userId);
+  const q = u.wizQueue || [];
+  const total = q.length;
+  const done = Math.min(u.wizIndex || 0, total);
+
+  const currentId = currentWizardChar(userId);
+  const currentName = currentId ? (charById.get(currentId)?.name || currentId) : "—";
+  const lockedMain = u.mainId ? (charById.get(u.mainId)?.name || u.mainId) : "не выбран";
+  const finished = wizardDone(userId);
+
+  // 1) Preview tierlist (always)
+  const preview = await renderDraftPreviewPng(userId, finished ? null : currentId);
+  const files = [new AttachmentBuilder(preview, { name: "preview.png" })];
+
+  // 2) Current character image (if exists)
+  let hasCharImage = false;
+  if (!finished && currentId) {
+    const iconPath = path.join(ASSETS_DIR, "characters", `${currentId}.png`);
+    if (fs.existsSync(iconPath)) {
+      files.push(new AttachmentBuilder(fs.readFileSync(iconPath), { name: "character.png" }));
+      hasCharImage = true;
+    }
+  }
+
+  const eChar = new EmbedBuilder()
+    .setTitle(finished ? "Готово" : `Сейчас: ${currentName}`)
+    .setDescription(
+      finished
+        ? "готово. проверь свой тир-лист ниже и нажми **отправить**."
+        : "выбери тир для текущего персонажа кнопками S A B C D."
+    )
+    .addFields(
+      { name: "Main", value: `⬛ **${lockedMain}** (locked)`, inline: true },
+      { name: "Прогресс", value: `${done}/${total}`, inline: true },
+      { name: "Сейчас", value: finished ? "—" : `**${currentName}**`, inline: false }
+    );
+
+  if (hasCharImage) {
+    eChar.setImage("attachment://character.png");
+  }
+
+  const ePreview = new EmbedBuilder()
+    .setTitle("Твой тир-лист")
+    .setDescription("обновляется после каждого клика.")
+    .setImage("attachment://preview.png");
+
+  const rows = [buildTierButtons(finished), buildWizardNavRow(userId)];
+  return { embeds: [eChar, ePreview], components: rows, files, attachments: [] };
+}
+
+// -------------------- DASHBOARD --------------------
+function dashboardComponents() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("start_rating").setLabel("Начать оценку").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("refresh_tierlist").setLabel("Обновить тир-лист").setStyle(ButtonStyle.Secondary)
+  );
+  return [row];
+}
+
+async function ensureDashboardMessage(client, channelId) {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased()) throw new Error("Channel is not text based");
+
+  const mid = state.settings.dashboardMessageId;
+  let msg = null;
+
+  if (mid) {
+    try { msg = await channel.messages.fetch(mid); } catch { msg = null; }
+  }
+
+  const png = await renderGlobalTierlistPng();
+  const attachment = new AttachmentBuilder(png, { name: "tierlist.png" });
+
+  const embed = new EmbedBuilder()
+    .setTitle(DASHBOARD_TITLE)
+    .setDescription("кнопка **начать оценку** откроет опрос (ephemeral). общий тир-лист обновится после **отправить**.")
+    .setImage("attachment://tierlist.png");
+
+  if (!msg) {
+    msg = await channel.send({ embeds: [embed], files: [attachment], components: dashboardComponents() });
+    try { await msg.pin(); } catch {}
+    state.settings.channelId = channelId;
+    state.settings.dashboardMessageId = msg.id;
+    state.settings.lastUpdated = Date.now();
+    saveState(state);
+    return msg;
+  }
+
+  await msg.edit({ embeds: [embed], files: [attachment], components: dashboardComponents(), attachments: [] });
+  state.settings.lastUpdated = Date.now();
+  saveState(state);
+  return msg;
+}
+
+async function refreshDashboard(client) {
+  const channelId = state.settings.channelId;
+  const msgId = state.settings.dashboardMessageId;
+  if (!channelId || !msgId) return false;
+
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channel = await guild.channels.fetch(channelId);
+  if (!channel || !channel.isTextBased()) return false;
+
+  let msg;
+  try { msg = await channel.messages.fetch(msgId); } catch { return false; }
+
+  const png = await renderGlobalTierlistPng();
+  const attachment = new AttachmentBuilder(png, { name: "tierlist.png" });
+
+  const embed = new EmbedBuilder()
+    .setTitle(DASHBOARD_TITLE)
+    .setDescription("кнопка **начать оценку** откроет опрос (ephemeral). общий тир-лист обновится после **отправить**.")
+    .setImage("attachment://tierlist.png");
+
+  await msg.edit({ embeds: [embed], files: [attachment], components: dashboardComponents(), attachments: [] });
+
+  state.settings.lastUpdated = Date.now();
+  saveState(state);
+  return true;
+}
+
+
+// -------------------- MOD PANEL (ephemeral control window) --------------------
+function buildPanelTierSelect(userId) {
+  const u = getUser(userId);
+  const selected = u.panelTierKey || "S";
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("panel_select_tier")
+    .setPlaceholder("Выбери тир для переименования")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      { label: "S", value: "S", default: selected === "S" },
+      { label: "A", value: "A", default: selected === "A" },
+      { label: "B", value: "B", default: selected === "B" },
+      { label: "C", value: "C", default: selected === "C" },
+      { label: "D", value: "D", default: selected === "D" }
+    );
+
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function buildPanelConfigPayload(userId) {
+  const cfg = getImageConfig();
+  const tierKey = (getUser(userId).panelTierKey || "S");
+  const tierName = state.tiers?.[tierKey]?.name || tierKey;
+
+  const e = new EmbedBuilder()
+    .setTitle("Tierlist Panel (mods)")
+    .setDescription(
+      [
+        `**Картинка:** ${cfg.W}×${cfg.H}`,
+        `**Иконки:** ${cfg.ICON}px`,
+        `**Переименование:** выбран **${tierKey}** → *${tierName}*`,
+        "",
+        "Кнопки ниже меняют параметры и сразу пересобирают PNG."
+      ].join("\\n")
+    );
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_refresh").setLabel("Пересобрать").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_icon_minus").setLabel("Иконки -").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_icon_plus").setLabel("Иконки +").setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_w_minus").setLabel("Ширина -").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_w_plus").setLabel("Ширина +").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_h_minus").setLabel("Высота -").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_h_plus").setLabel("Высота +").setStyle(ButtonStyle.Secondary)
+  );
+
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_rename").setLabel("Переименовать тир").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("panel_reset_img").setLabel("Сбросить размеры").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_fonts").setLabel("Шрифты").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [e], components: [row1, row2, buildPanelTierSelect(userId), row3] };
+}
+
+
+// -------------------- PANEL TABS + PARTICIPANTS (1-4) --------------------
+function buildPanelTabsRow(userId) {
+  const u = getUser(userId);
+  const tab = u.panelTab || "config";
+
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`approve:${subId}`).setLabel("Approve").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId(`edit:${subId}`).setLabel("Edit ELO").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`reject:${subId}`).setLabel("Reject").setStyle(ButtonStyle.Danger)
+    new ButtonBuilder()
+      .setCustomId("panel_tab_config")
+      .setLabel("Настройки")
+      .setStyle(tab === "config" ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("panel_tab_participants")
+      .setLabel("Участники")
+      .setStyle(tab === "participants" ? ButtonStyle.Primary : ButtonStyle.Secondary)
   );
 }
 
-// ====== SLASH COMMANDS ======
-function buildCommands() {
-  return [
-    new SlashCommandBuilder()
-      .setName("elo")
-      .setDescription("ELO tierlist commands")
-      .addSubcommand(s => s.setName("me").setDescription("Показать мой рейтинг"))
-      .addSubcommand(s => s.setName("user").setDescription("Показать рейтинг игрока")
-        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
-      .addSubcommand(s => s.setName("pending").setDescription("Показать pending заявки (модеры)"))
-      .addSubcommand(s => s.setName("rebuild").setDescription("Пересобрать закреп (модеры)"))
-      .addSubcommand(s => s.setName("remove").setDescription("Удалить игрока из тир-листа (модеры)")
-        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
-      .addSubcommand(s => s.setName("wipe").setDescription("Очистить рейтинг полностью (модеры)")
-        .addStringOption(o => o.setName("mode").setDescription("soft=только база, hard=база+удалить карточки").setRequired(true)
-          .addChoices(
-            { name: "soft", value: "soft" },
-            { name: "hard", value: "hard" }
-          ))
-        .addStringOption(o => o.setName("confirm").setDescription('Напиши WIPE чтобы подтвердить').setRequired(true)))
-      .addSubcommand(s => s.setName("labels").setDescription("Поменять названия тиров (модеры)")
-        .addStringOption(o => o.setName("t1").setDescription("Название тира 1").setRequired(true))
-        .addStringOption(o => o.setName("t2").setDescription("Название тира 2").setRequired(true))
-        .addStringOption(o => o.setName("t3").setDescription("Название тира 3").setRequired(true))
-        .addStringOption(o => o.setName("t4").setDescription("Название тира 4").setRequired(true))
-        .addStringOption(o => o.setName("t5").setDescription("Название тира 5").setRequired(true)))
-      .addSubcommand(s => s.setName("minicards").setDescription("Пересоздать мини-карточки в submit (модеры)"))
-  ].map(c => c.toJSON());
+function getParticipantsList() {
+  const out = [];
+  for (const [uid, votes] of Object.entries(state.finalVotes || {})) {
+    if (!votes || Object.keys(votes).length === 0) continue;
+
+    const u = state.users?.[uid] || {};
+    const inferredSubmit = (u.lockUntil && Number.isFinite(u.lockUntil)) ? (u.lockUntil - COOLDOWN_MS) : 0;
+    const lastSubmitAt = Number(u.lastSubmitAt) || inferredSubmit || 0;
+
+    out.push({
+      userId: uid,
+      mainId: u.mainId || null,
+      lastSubmitAt
+    });
+  }
+
+  out.sort((a, b) => {
+    if (b.lastSubmitAt !== a.lastSubmitAt) return b.lastSubmitAt - a.lastSubmitAt;
+    return String(a.userId).localeCompare(String(b.userId));
+  });
+  return out;
 }
 
-async function registerGuildCommands(client) {
-  if (!GUILD_ID) throw new Error("Нет GUILD_ID в .env");
-  const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.commands.set(buildCommands());
+function buildParticipantsSelectRow(userId, participants) {
+  const u = getUser(userId);
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(participants.length / pageSize) - 1);
+  const page = Math.min(maxPage, Math.max(0, Number(u.panelParticipantsPage) || 0));
+  const start = page * pageSize;
+  const slice = participants.slice(start, start + pageSize);
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("panel_part_select_user")
+    .setPlaceholder(slice.length ? "Выбери участника" : "Нет участников")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .setDisabled(slice.length === 0);
+
+  for (const p of slice) {
+    const mainName = p.mainId ? (charById.get(p.mainId)?.name || p.mainId) : "—";
+    menu.addOptions({
+      label: String(p.userId).slice(0, 100),
+      value: p.userId,
+      description: `main: ${mainName}`.slice(0, 100),
+      default: u.panelParticipantId === p.userId
+    });
+  }
+
+  return new ActionRowBuilder().addComponents(menu);
 }
 
-// ====== DISCORD CLIENT ======
+function buildParticipantsNavRow(userId, participants) {
+  const u = getUser(userId);
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(participants.length / pageSize) - 1);
+  const page = Math.min(maxPage, Math.max(0, Number(u.panelParticipantsPage) || 0));
+
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_part_prev").setLabel("⟵").setStyle(ButtonStyle.Secondary).setDisabled(page <= 0),
+    new ButtonBuilder().setCustomId("panel_part_next").setLabel("⟶").setStyle(ButtonStyle.Secondary).setDisabled(page >= maxPage),
+    new ButtonBuilder().setCustomId("panel_part_refresh").setLabel("Обновить").setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function buildParticipantsListPayload(userId) {
+  const u = getUser(userId);
+  const participants = getParticipantsList();
+
+  const pageSize = 25;
+  const maxPage = Math.max(0, Math.ceil(participants.length / pageSize) - 1);
+  const page = Math.min(maxPage, Math.max(0, Number(u.panelParticipantsPage) || 0));
+
+  const start = page * pageSize;
+  const slice = participants.slice(start, start + pageSize);
+  const preview = slice.slice(0, 12).map((p, i) => {
+    const mainName = p.mainId ? (charById.get(p.mainId)?.name || p.mainId) : "—";
+    const when = p.lastSubmitAt ? formatTime(p.lastSubmitAt) : "—";
+    return `${start + i + 1}) <@${p.userId}>  main: **${mainName}**  submit: ${when}`;
+  });
+
+  const e = new EmbedBuilder()
+    .setTitle("Участники тир-листа")
+    .setDescription(
+      [
+        `Всего: **${participants.length}**`,
+        `Страница: **${page + 1}/${maxPage + 1}**`,
+        "",
+        preview.length ? preview.join("\n") : "Пока никто не отправлял тир-лист."
+      ].join("\n")
+    );
+
+  const actions = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Danger)
+  );
+
+  return {
+    embeds: [e],
+    components: [
+      buildPanelTabsRow(userId),
+      buildParticipantsSelectRow(userId, participants),
+      buildParticipantsNavRow(userId, participants),
+      actions
+    ]
+  };
+}
+
+function getUserTierCounts(votesObj) {
+  const counts = { S: 0, A: 0, B: 0, C: 0, D: 0 };
+  if (!votesObj) return counts;
+  for (const t of Object.values(votesObj)) {
+    if (counts[t] != null) counts[t]++;
+  }
+  return counts;
+}
+
+function buildParticipantsDetailPayload(userId) {
+  const u = getUser(userId);
+  const targetId = u.panelParticipantId;
+  const votes = targetId ? (state.finalVotes?.[targetId] || null) : null;
+
+  if (!targetId || !votes || Object.keys(votes).length === 0) {
+    u.panelParticipantId = null;
+    u.panelDeleteTargetId = null;
+    u.panelDeleteMode = null;
+    saveState(state);
+    return buildParticipantsListPayload(userId);
+  }
+
+  const tu = state.users?.[targetId] || {};
+  const mainName = tu.mainId ? (charById.get(tu.mainId)?.name || tu.mainId) : "—";
+  const inferredSubmit = (tu.lockUntil && Number.isFinite(tu.lockUntil)) ? (tu.lockUntil - COOLDOWN_MS) : 0;
+  const lastSubmitAt = Number(tu.lastSubmitAt) || inferredSubmit || 0;
+  const when = lastSubmitAt ? formatTime(lastSubmitAt) : "—";
+  const counts = getUserTierCounts(votes);
+
+  const e = new EmbedBuilder()
+    .setTitle("Участник")
+    .setDescription(`<@${targetId}>`)
+    .addFields(
+      { name: "Main", value: `**${mainName}**`, inline: true },
+      { name: "Submit", value: `${when}`, inline: true },
+      { name: "S/A/B/C/D", value: `${counts.S}/${counts.A}/${counts.B}/${counts.C}/${counts.D}`, inline: false }
+    );
+
+  const pending = (u.panelDeleteTargetId === targetId) ? u.panelDeleteMode : null;
+  if (pending) {
+    e.addFields({
+      name: "Подтверждение удаления",
+      value: pending === "full"
+        ? "⚠️ **Полный сброс пользователя** (удалит голос + user record + черновики). Нажми **Подтвердить** или **Отмена**."
+        : "⚠️ **Удаление голоса** (уберёт вклад в общий тир-лист). Нажми **Подтвердить** или **Отмена**.",
+      inline: false
+    });
+  }
+
+  const components = [buildPanelTabsRow(userId)];
+
+  if (!pending) {
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_view_png").setLabel("Показать PNG").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("panel_part_delete_votes").setLabel("Удалить голос").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("panel_part_delete_full").setLabel("Полный сброс").setStyle(ButtonStyle.Danger)
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_back").setLabel("Назад").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Secondary)
+    );
+    components.push(row1, row2);
+  } else {
+    const row1 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_confirm_delete").setLabel("Подтвердить").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("panel_part_cancel_delete").setLabel("Отмена").setStyle(ButtonStyle.Secondary)
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("panel_part_back").setLabel("Назад").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("panel_close").setLabel("Закрыть").setStyle(ButtonStyle.Secondary)
+    );
+    components.push(row1, row2);
+  }
+
+  return { embeds: [e], components };
+}
+
+function buildParticipantsPayload(userId) {
+  const u = getUser(userId);
+  if (u.panelParticipantId) return buildParticipantsDetailPayload(userId);
+  return buildParticipantsListPayload(userId);
+}
+
+function buildPanelPayload(userId) {
+  const u = getUser(userId);
+  const tab = u.panelTab || "config";
+
+  if (tab === "participants") {
+    return buildParticipantsPayload(userId);
+  }
+
+  const base = buildPanelConfigPayload(userId);
+  base.components = [buildPanelTabsRow(userId), ...(base.components || [])];
+  return base;
+}
+
+
+
+
+function applyImageDelta(kind, delta) {
+  state.settings.image ||= { width: null, height: null, icon: null };
+
+  const cfg = getImageConfig();
+
+  if (kind === "icon") {
+    const minV = 64, maxV = 256;
+    const next = Math.max(minV, Math.min(maxV, cfg.ICON + delta));
+    state.settings.image.icon = next;
+  } else if (kind === "width") {
+    const minV = 1200, maxV = 4096;
+    const next = Math.max(minV, Math.min(maxV, cfg.W + delta));
+    state.settings.image.width = next;
+  } else if (kind === "height") {
+    const minV = 700, maxV = 2160;
+    const next = Math.max(minV, Math.min(maxV, cfg.H + delta));
+    state.settings.image.height = next;
+  }
+}
+
+function resetImageOverrides() {
+  state.settings.image ||= { width: null, height: null, icon: null };
+  state.settings.image.width = null;
+  state.settings.image.height = null;
+  state.settings.image.icon = null;
+}
+
+
+// -------------------- SAFE REPLY HELPERS --------------------
+async function safeRespond(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(payload);
+    }
+    return await interaction.reply(payload);
+  } catch (e) {
+    try {
+      return await interaction.followUp({ ...payload, ephemeral: true });
+    } catch {}
+  }
+}
+
+
+// -------------------- AUDIT TIMEOUT LOOKUP --------------------
+// Discord UI Audit Log does not show seconds. This command fetches audit entries and prints exact time with seconds.
+// Requires bot permission: View Audit Log.
+
+function fmtDateTime(ts) {
+  return new Date(ts).toLocaleString("ru-RU", {
+    timeZone: "Europe/London",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+}
+
+function fmtDur(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = s % 60;
+  const parts = [];
+  if (h) parts.push(`${h}ч`);
+  if (m || h) parts.push(`${m}м`);
+  parts.push(`${ss}с`);
+  return parts.join(" ");
+}
+
+function extractTimeoutChange(entry) {
+  try {
+    const ch = (entry.changes || []).find(c => c.key === "communication_disabled_until");
+    if (!ch) return null;
+
+    const newVal = ch.new ?? null;
+    const oldVal = ch.old ?? null;
+
+    const kind = newVal ? "SET" : "REMOVE";
+    const untilMs = newVal ? Date.parse(newVal) : null;
+    const oldUntilMs = oldVal ? Date.parse(oldVal) : null;
+
+    const durMs = (kind === "SET" && Number.isFinite(untilMs)) ? (untilMs - entry.createdTimestamp) : null;
+
+    return { kind, untilMs, oldUntilMs, durMs };
+  } catch {
+    return null;
+  }
+}
+
+async function ensureAuditCommand(client) {
+  try {
+    if (!GUILD_ID) return;
+    const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+    if (!guild) return;
+
+    const data = new SlashCommandBuilder()
+      .setName("audit")
+      .setDescription("Показать аудит-ивенты с секундами (mods)")
+      .addSubcommand(sc =>
+        sc.setName("timeouts")
+          .setDescription("Последние таймауты/снятия таймаута (из Audit Log) с секундами")
+          .addIntegerOption(o =>
+            o.setName("hours")
+              .setDescription("За сколько часов назад смотреть (по умолчанию 48)")
+              .setRequired(false)
+              .setMinValue(1)
+              .setMaxValue(240)
+          )
+          .addIntegerOption(o =>
+            o.setName("limit")
+              .setDescription("Сколько записей брать из аудита (по умолчанию 50)")
+              .setRequired(false)
+              .setMinValue(5)
+              .setMaxValue(100)
+          )
+          .addStringOption(o =>
+            o.setName("mode")
+              .setDescription("Только выдача / только снятие / всё")
+              .setRequired(false)
+              .addChoices(
+                { name: "всё", value: "any" },
+                { name: "выдача", value: "set" },
+                { name: "снятие", value: "remove" }
+              )
+          )
+          .addUserOption(o =>
+            o.setName("user")
+              .setDescription("Фильтр по пользователю")
+              .setRequired(false)
+          )
+      )
+      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild);
+
+    const existing = await guild.commands.fetch().catch(() => null);
+    if (!existing) return;
+
+    const cmd = existing.find(c => c.name === "audit");
+    if (cmd) {
+      await guild.commands.edit(cmd.id, data.toJSON()).catch(() => {});
+    } else {
+      await guild.commands.create(data.toJSON()).catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+}
+
+
+// -------------------- CLIENT --------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-  ],
+    GatewayIntentBits.GuildModeration
+  ]
 });
 
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  // Print font diagnostics once on startup
+  tryRegisterFonts();
+  console.log("[fonts] regular:", FONT_INFO.regularFile, "bold:", FONT_INFO.boldFile, "fallback:", FONT_INFO.usedFallback);
 
-  // рег слэш-команд (guild, применяются быстро)
-  await registerGuildCommands(client);
-
-  await ensureIndexMessage(client);
-  await updateIndex(client);
-  await syncTierRolesOnStart(client);
-  await syncMiniCards(client);
-
-  console.log("Ready");
-});
-
-// ====== SUBMIT CHANNEL ONLY ======
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (message.channelId !== SUBMIT_CHANNEL_ID) return;
-
-  const elo = parseElo(message.content);
-  const attachment = message.attachments.first();
-  const tier = elo ? tierFor(elo) : null;
-
-  // невалидно -> удалить и не отправлять
-  if (!attachment || !isImageAttachment(attachment) || !elo || !tier) {
-    const warn = await message.reply("Невалидно. Нужен **скрин (картинка)** и **ELO числом от 15**. Пример: `73`");
-    setTimeout(() => warn.delete().catch(() => {}), 8000);
-    message.delete().catch(() => {});
-    return;
+  if ((!state.settings.channelId || !state.settings.dashboardMessageId) && DEFAULT_CHANNEL_ID) {
+    try {
+      await ensureDashboardMessage(client, DEFAULT_CHANNEL_ID);
+      console.log("Dashboard created/updated in DEFAULT_CHANNEL_ID");
+    } catch (e) {
+      console.error("Auto-setup failed:", e.message);
+    }
   }
-
-  // дубликат ELO -> не принимать
-  const current = db.ratings[message.author.id];
-  if (current && Number(current.elo) === Number(elo)) {
-    const warn = await message.reply("У тебя уже стоит **такой же ELO** в тир-листе. Если изменится — присылай новый скрин.");
-    setTimeout(() => warn.delete().catch(() => {}), 8000);
-    message.delete().catch(() => {});
-    return;
-  }
-
-  // pending уже есть
-  const hasPending = Object.values(db.submissions).some(
-    (s) => s.userId === message.author.id && s.status === "pending"
-  );
-  if (hasPending) {
-    const warn = await message.reply("У тебя уже есть заявка на проверке. Дождись решения модера.");
-    setTimeout(() => warn.delete().catch(() => {}), 8000);
-    message.delete().catch(() => {});
-    return;
-  }
-
-  // кулдаун только на валидные
-  const now = Date.now();
-  const last = db.cooldowns[message.author.id] || 0;
-  const left = SUBMIT_COOLDOWN_SECONDS - Math.floor((now - last) / 1000);
-  if (left > 0) {
-    const warn = await message.reply(`Кулдаун. Подожди ${left} сек и попробуй снова.`);
-    setTimeout(() => warn.delete().catch(() => {}), 8000);
-    message.delete().catch(() => {});
-    return;
-  }
-
-  const submissionId = makeId();
-
-  // Перезаливаем скрин в review, чтобы картинка стабильно открывалась
-  // (не зависит от временных ссылок и удаления исходного сообщения).
-  let reviewFile = null;
-  let reviewImage = attachment.url;
-  let reviewFileName = null;
+  // A) realtime influence: refresh existing voters once on startup
   try {
-    const buf = await downloadToBuffer(attachment.url);
-    reviewFileName = sanitizeFileName(`${submissionId}_${attachment.name || "screenshot"}`);
-    reviewFile = new AttachmentBuilder(buf, { name: reviewFileName });
-    reviewImage = `attachment://${reviewFileName}`;
+    const res = await backfillInfluenceForExistingVoters(client, { refresh: true });
+    if (res.total > 0) {
+      console.log(`[influence] startup backfill: changed ${res.changed}/${res.total}`);
+    }
+  } catch (e) {
+    console.error("[influence] startup backfill failed:", e?.message || e);
+  }
+
+});
+
+
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+  // realtime influence update when tier roles are changed
+  try {
+    const uid = newMember.id;
+
+    const hasVote = Boolean(state.finalVotes?.[uid] && Object.keys(state.finalVotes[uid] || {}).length > 0);
+    const isTracked = Boolean(state.users?.[uid]);
+
+    // Avoid tracking everyone in the server; only update if this user matters to our state.
+    if (!hasVote && !isTracked) return;
+
+    const inf = resolveInfluenceFromMember(newMember);
+    const u = getUser(uid);
+
+    const prev = Number(u.influenceMultiplier) || 1;
+    const prevRole = u.influenceRoleId || null;
+
+    if (prev === inf.mult && prevRole === (inf.roleId || null)) return;
+
+    u.influenceMultiplier = inf.mult;
+    u.influenceRoleId = inf.roleId;
+    u.influenceUpdatedAt = Date.now();
+    saveState(state);
+
+    if (hasVote) {
+      // their weight affects global tierlist -> refresh image
+      await refreshDashboard(client).catch(() => {});
+    }
   } catch {
-    // fallback: оставляем URL как есть (лучше чем ничего)
-    reviewFile = null;
-    reviewImage = attachment.url;
-    reviewFileName = null;
+    // ignore
   }
-  db.submissions[submissionId] = {
-    id: submissionId,
-    userId: message.author.id,
-    name: message.member?.displayName || message.author.username,
-    elo,
-    tier,
-    screenshotUrl: attachment.url,
-    reviewImage,
-    reviewFileName,
-    messageUrl: message.url,
-    status: "pending",
-    createdAt: new Date().toISOString(),
-    reviewChannelId: null,
-    reviewMessageId: null,
-  };
-
-  // кулдаун ставим после валидной заявки
-  db.cooldowns[message.author.id] = Date.now();
-  saveDB(db);
-
-  const reviewChannel = await client.channels.fetch(REVIEW_CHANNEL_ID).catch(() => null);
-  if (!reviewChannel || !reviewChannel.isTextBased()) return;
-
-  const sub = db.submissions[submissionId];
-  const payload = {
-    embeds: [buildReviewEmbed(sub, "pending")],
-    components: [buildReviewButtons(submissionId)],
-  };
-  if (reviewFile) payload.files = [reviewFile];
-  const sent = await reviewChannel.send(payload);
-
-  // сохраняем, чтобы модалки могли редактировать сообщение
-  sub.reviewChannelId = sent.channel.id;
-  sub.reviewMessageId = sent.id;
-  saveDB(db);
-
-  const ok = await message.reply("Заявка отправлена на проверку модерам.");
-  setTimeout(() => ok.delete().catch(() => {}), 8000);
-
-  message.delete().catch(() => {});
 });
 
-// ====== INTERACTIONS: slash + buttons + modals ======
+
+
 client.on("interactionCreate", async (interaction) => {
-  // ---- SLASH ----
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName !== "elo") return;
+  try {
 
-    const sub = interaction.options.getSubcommand();
+    // ---------------- MODAL SUBMITS ----------------
+    if (interaction.isModalSubmit()) {
+      if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
 
-    // /elo me
-    if (sub === "me") {
-      const r = db.ratings[interaction.user.id];
-      if (!r) {
-        await interaction.reply({ content: "Тебя нет в тир-листе.", ephemeral: true });
-        return;
-      }
-      await interaction.reply({
-        content: `Ты: <@${r.userId}>\nELO: **${r.elo}**\nТир: **${r.tier}** (${formatTierTitle(r.tier)})`,
-        ephemeral: true,
-      });
-      return;
-    }
+      if (interaction.customId.startsWith("panel_rename_modal:")) {
+        const tierKey = interaction.customId.split(":")[1] || "S";
+        const name = (interaction.fields.getTextInputValue("tier_name") || "").trim().slice(0, 24);
+        if (!name) return interaction.reply({ content: "Пустое имя.", ephemeral: true });
 
-    // /elo user
-    if (sub === "user") {
-      const target = interaction.options.getUser("target", true);
-      const r = db.ratings[target.id];
-      if (!r) {
-        await interaction.reply({ content: "Этого игрока нет в тир-листе.", ephemeral: true });
-        return;
-      }
-      await interaction.reply({
-        content: `Игрок: <@${r.userId}> (${r.name})\nELO: **${r.elo}**\nТир: **${r.tier}** (${formatTierTitle(r.tier)})`,
-        ephemeral: true,
-      });
-      return;
-    }
+        state.tiers[tierKey] ||= {};
+        state.tiers[tierKey].name = name;
+        saveState(state);
 
-    // mod-only from here
-    if (!isModerator(interaction.member)) {
-      await interaction.reply({ content: "Нет прав.", ephemeral: true });
-      return;
-    }
-
-    // /elo pending
-    if (sub === "pending") {
-      const pend = Object.values(db.submissions)
-        .filter(s => s.status === "pending")
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-        .slice(0, 15);
-
-      if (!pend.length) {
-        await interaction.reply({ content: "Pending заявок нет.", ephemeral: true });
-        return;
+        await interaction.deferReply({ ephemeral: true });
+        await refreshDashboard(client);
+        return interaction.editReply(`Ок. Теперь **${tierKey}** называется: **${name}**.`);
       }
 
-      const lines = pend.map(s =>
-        `• <@${s.userId}> ELO **${s.elo}** (id \`${s.id}\`)`
-      );
-
-      await interaction.reply({
-        content: `Pending (${pend.length} из ${Object.values(db.submissions).filter(s=>s.status==="pending").length}):\n${lines.join("\n")}`,
-        ephemeral: true,
-      });
-      return;
+      return interaction.reply({ content: "Неизвестная модалка.", ephemeral: true });
     }
 
-    // /elo rebuild
-    if (sub === "rebuild") {
-      await updateIndex(client);
-      await interaction.reply({ content: "Закреп пересобран.", ephemeral: true });
-      return;
-    }
+    // ---------------- SLASH COMMANDS ----------------
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "setup") {
+  if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+  const ch = interaction.options.getChannel("channel", true);
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    await ensureDashboardMessage(client, ch.id);
+    return interaction.editReply("Готово. Dashboard создан/обновлён (и закреплён, если бот смог).");
+  } catch (e) {
+    console.error("setup failed:", e);
+    return interaction.editReply(`Setup failed: ${e?.message || "unknown"}`);
+  }
+}
 
-    // /elo minicards
-    if (sub === "minicards") {
-      const res = await syncMiniCards(client);
-      await interaction.reply({
-        content: `Мини-карточки: создано ${res.created}, удалено ${res.removed}, всего в тир-листе ${res.total}.`,
-        ephemeral: true,
-      });
-      return;
-    }
+      if (interaction.commandName === "tiers") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+        const sub = interaction.options.getSubcommand();
+        if (sub === "set") {
+          const tier = interaction.options.getString("tier", true);
+          const name = interaction.options.getString("name", true).slice(0, 24);
+          state.tiers[tier] ||= {};
+          state.tiers[tier].name = name;
+          saveState(state);
 
-
-    // /elo labels
-    if (sub === "labels") {
-      db.config.tierLabels = {
-        1: interaction.options.getString("t1", true),
-        2: interaction.options.getString("t2", true),
-        3: interaction.options.getString("t3", true),
-        4: interaction.options.getString("t4", true),
-        5: interaction.options.getString("t5", true),
-      };
-      saveDB(db);
-      await updateIndex(client);
-      await interaction.reply({ content: "Названия тиров обновлены.", ephemeral: true });
-      return;
-    }
-
-    // /elo remove
-    if (sub === "remove") {
-      const target = interaction.options.getUser("target", true);
-      const rating = db.ratings[target.id];
-
-      if (!rating) {
-        await interaction.reply({ content: "Этого игрока нет в тир-листе.", ephemeral: true });
-        return;
-      }
-
-      if (rating.cardMessageId) {
-        const ch = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
-        if (ch?.isTextBased()) {
-          const msg = await ch.messages.fetch(rating.cardMessageId).catch(() => null);
-          if (msg) await msg.delete().catch(() => {});
+          await interaction.deferReply({ ephemeral: true });
+          await refreshDashboard(client);
+          return interaction.editReply(`Ок. Теперь **${tier}** называется: **${name}** (картинка обновлена).`);
         }
       }
 
-      delete db.ratings[target.id];
-      saveDB(db);
-      await deleteMiniCardMessage(client, target.id);
-      await updateIndex(client);
-      await clearAllTierRoles(client, target.id, "Removed from tierlist");
-
-      await interaction.reply({ content: `Удалил <@${target.id}> из тир-листа.`, ephemeral: true });
-      return;
-    }
-
-    // /elo wipe
-    if (sub === "wipe") {
-      const mode = interaction.options.getString("mode", true);
-      const confirm = interaction.options.getString("confirm", true);
-
-      if (confirm !== "WIPE") {
-        await interaction.reply({ content: 'Не подтверждено. В confirm надо написать ровно: WIPE', ephemeral: true });
-        return;
+      if (interaction.commandName === "rebuild") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        const ok = await refreshDashboard(client);
+        return interaction.editReply(ok ? "Картинка обновлена." : "Не нашёл dashboard. Сначала /setup.");
       }
 
-      if (mode === "hard") {
-        const ch = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
-        if (ch?.isTextBased()) {
-          for (const r of Object.values(db.ratings)) {
-            if (!r.cardMessageId) continue;
-            const msg = await ch.messages.fetch(r.cardMessageId).catch(() => null);
-            if (msg) await msg.delete().catch(() => {});
+      if (interaction.commandName === "stats") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const { votersCount } = computeGlobalBuckets();
+        const cfg = getImageConfig();
+        const lines = [
+          `channelId: ${state.settings.channelId || "—"}`,
+          `dashboardMessageId: ${state.settings.dashboardMessageId || "—"}`,
+          `voters: ${votersCount}`,
+          `lastUpdated: ${state.settings.lastUpdated ? formatTime(state.settings.lastUpdated) : "—"}`,
+          `img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON}`
+        ];
+        return interaction.reply({ content: lines.join("\n"), ephemeral: true });
+      }
+
+      if (interaction.commandName === "debug") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const sub = interaction.options.getSubcommand();
+        if (sub === "fonts") {
+          tryRegisterFonts();
+          const files = listTtfFiles();
+          const lines = [
+            `assets/fonts ttf files:`,
+            files.length ? files.map(f => `- ${path.basename(f)}`).join("\n") : "- (none)",
+            "",
+            `picked regular: ${FONT_INFO.regularFile ? path.basename(FONT_INFO.regularFile) : "(null)"}`,
+            `picked bold: ${FONT_INFO.boldFile ? path.basename(FONT_INFO.boldFile) : "(null)"}`,
+            `fallback: ${FONT_INFO.usedFallback}`
+          ];
+          return interaction.reply({ content: lines.join("\n"), ephemeral: true });
+        }
+      }
+
+      if (interaction.commandName === "image") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === "show") {
+          const cfg = getImageConfig();
+          return interaction.reply({ content: `img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON}`, ephemeral: true });
+        }
+
+        if (sub === "set") {
+          const width = interaction.options.getInteger("width");
+          const height = interaction.options.getInteger("height");
+          const icon = interaction.options.getInteger("icon");
+
+          if (width) state.settings.image.width = width;
+          if (height) state.settings.image.height = height;
+          if (icon) state.settings.image.icon = icon;
+          saveState(state);
+
+          await interaction.deferReply({ ephemeral: true });
+          await refreshDashboard(client);
+          const cfg = getImageConfig();
+          return interaction.editReply(`Ок. Теперь img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON} (картинка обновлена).`);
+        }
+      }
+      if (interaction.commandName === "panel") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (mods).", ephemeral: true });
+        const payload = buildPanelPayload(interaction.user.id);
+        return interaction.reply({ ...payload, ephemeral: true });
+      }
+
+      if (interaction.commandName === "audit") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
+
+        const sub = interaction.options.getSubcommand();
+        if (sub === "timeouts") {
+          await interaction.deferReply({ ephemeral: true });
+
+          const hours = interaction.options.getInteger("hours") || 48;
+          const limit = interaction.options.getInteger("limit") || 50;
+          const mode = (interaction.options.getString("mode") || "any").toLowerCase();
+          const targetUser = interaction.options.getUser("user");
+
+          const sinceMs = Date.now() - (Math.max(1, Math.min(240, hours)) * 3600_000);
+
+          const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+          if (!guild) return interaction.editReply("Не нашёл guild. Проверь GUILD_ID.");
+
+          // Fetch audit logs (timeouts are stored as MemberUpdate with change key communication_disabled_until)
+          let fetched = null;
+          try {
+            fetched = await guild.fetchAuditLogs({ type: AuditLogEvent.MemberUpdate, limit: Math.max(5, Math.min(100, limit)) });
+          } catch {
+            // fallback: fetch without type and filter
+            fetched = await guild.fetchAuditLogs({ limit: Math.max(5, Math.min(100, limit)) }).catch(() => null);
           }
+          if (!fetched) return interaction.editReply("Не удалось получить Audit Log. Проверь права бота: View Audit Log.");
+
+          const out = [];
+          for (const entry of fetched.entries.values()) {
+            if (entry.createdTimestamp < sinceMs) continue;
+
+            const ch = extractTimeoutChange(entry);
+            if (!ch) continue;
+
+            if (mode === "set" && ch.kind !== "SET") continue;
+            if (mode === "remove" && ch.kind !== "REMOVE") continue;
+
+            const targetId = entry.target?.id || null;
+            if (targetUser && targetId && targetId !== targetUser.id) continue;
+
+            const exec = entry.executor ? `${entry.executor.tag}` : "unknown";
+            const t = fmtDateTime(entry.createdTimestamp);
+
+            if (ch.kind === "SET") {
+              const until = ch.untilMs ? fmtDateTime(ch.untilMs) : "—";
+              const dur = ch.durMs ? fmtDur(ch.durMs) : "—";
+              out.push(`${t} SET  <@${targetId || "?"}>  by ${exec}  until ${until}  (${dur})`);
+            } else {
+              const oldUntil = ch.oldUntilMs ? fmtDateTime(ch.oldUntilMs) : "—";
+              out.push(`${t} REMOVE  <@${targetId || "?"}>  by ${exec}  was until ${oldUntil}`);
+            }
+
+            if (out.length >= 20) break; // keep reply short
+          }
+
+          if (!out.length) {
+            return interaction.editReply("Не нашёл записей про таймауты за выбранный период. Увеличь hours или limit.");
+          }
+
+          const header = `Найдено: ${out.length} (показано до 20). Период: последние ${hours}ч.`;
+          const msg = [header, "", ...out].join("\n");
+          return interaction.editReply(msg.slice(0, 1900));
         }
+
+        return interaction.reply({ content: "Неизвестная подкоманда.", ephemeral: true });
       }
 
-      const _wipeIds = Object.keys(db.ratings || {});
-      for (const uid of _wipeIds) {
-        await clearAllTierRoles(client, uid, "Wipe ratings");
-      }
-
-      // мини-карточки в submit должны пропасть, раз тир-лист очищен
-      const _miniIds = Object.keys(db.miniCards || {});
-      for (const uid of _miniIds) {
-        await deleteMiniCardMessage(client, uid);
-      }
-      db.miniCards = {};
-
-      db.ratings = {};
-      saveDB(db);
-      await updateIndex(client);
-
-      await logLine(client, `WIPE_RATINGS (${mode}) by ${interaction.user.tag}`);
-      await interaction.reply({ content: `Рейтинг очищен. mode=${mode}`, ephemeral: true });
-      return;
     }
 
-    return;
+    // ---------------- BUTTONS ----------------
+    if (interaction.isButton()) {
+      const userId = interaction.user.id;
+      const u = getUser(userId);
+
+if (interaction.customId === "refresh_tierlist") {
+  if (!isModerator(interaction)) {
+    return interaction.reply({ content: "Нет прав (нужно Manage Guild).", ephemeral: true });
   }
+  await interaction.deferReply({ ephemeral: true });
+  const ok = await refreshDashboard(client);
+  return interaction.editReply(ok ? "Ок. Тир-лист обновлён." : "Не нашёл dashboard. Сначала /setup.");
+}
 
-  // ---- BUTTONS ----
-  if (interaction.isButton()) {
-    const [action, submissionId] = interaction.customId.split(":");
-    const sub = db.submissions[submissionId];
+      if (interaction.customId === "my_status") {
+        const main = u.mainId ? (charById.get(u.mainId)?.name || u.mainId) : "не выбран";
+        const locked = isLocked(userId);
+        const votes = state.finalVotes?.[userId] || null;
 
-    if (!isModerator(interaction.member)) {
-      await interaction.reply({ content: "Нет прав.", ephemeral: true });
-      return;
-    }
-    if (!sub) {
-      await interaction.reply({ content: "Заявка не найдена.", ephemeral: true });
-      return;
-    }
-    if (sub.status !== "pending") {
-      await interaction.reply({ content: `Уже обработано: ${sub.status}`, ephemeral: true });
-      return;
-    }
-    if (hoursSince(sub.createdAt) > PENDING_EXPIRE_HOURS) {
-      sub.status = "expired";
-      saveDB(db);
-      const msg = await fetchReviewMessage(client, sub);
-      if (msg) await msg.edit({ embeds: [buildReviewEmbed(sub, "expired")], components: [] }).catch(() => {});
-      await interaction.reply({ content: "Заявка протухла (expired).", ephemeral: true });
-      return;
-    }
+        // If user has submitted, show their submitted tierlist PNG (same settings as main)
+        if (votes && Object.keys(votes).length > 0) {
+          await interaction.deferReply({ ephemeral: true });
 
-    // Approve
-    if (action === "approve") {
-      const tier = tierFor(sub.elo);
-      if (!tier) {
-        sub.status = "rejected";
-        sub.reviewedBy = interaction.user.tag;
-        sub.reviewedAt = new Date().toISOString();
-        sub.rejectReason = "ELO ниже 15";
-        saveDB(db);
+          const png = await renderUserFinalTierlistPng(userId, "(твой тир-лист)");
+          const attachment = new AttachmentBuilder(png, { name: "my-tierlist.png" });
 
-        await interaction.message.edit({
-          embeds: [buildReviewEmbed(sub, "rejected", [{ name: "Причина", value: sub.rejectReason, inline: false }])],
-          components: [],
-        }).catch(() => {});
-        await interaction.reply({ content: "ELO ниже 15. Отклонено.", ephemeral: true });
-        return;
+          const lastSubmitAt = u.lastSubmitAt ? formatTime(u.lastSubmitAt) : "—";
+          const counts = getUserTierCounts(votes);
+
+          const emb = new EmbedBuilder()
+            .setTitle("Твой статус")
+            .setDescription(
+              [
+                `Main: **${main}**`,
+                `Submit: ${lastSubmitAt}`,
+                `S/A/B/C/D: ${counts.S}/${counts.A}/${counts.B}/${counts.C}/${counts.D}`,
+                locked ? `Кулдаун до: **${formatTime(u.lockUntil)}**` : "Можно отправлять оценку: **да**"
+              ].join("\n")
+            )
+            .setImage("attachment://my-tierlist.png");
+
+          return interaction.editReply({ embeds: [emb], files: [attachment] });
+        }
+
+        const lines = [
+          `Main: **${main}**`,
+          "Ты ещё не отправлял тир-лист.",
+          locked ? `Кулдаун до: **${formatTime(u.lockUntil)}**` : "Можно отправлять оценку: **да**"
+        ];
+        return interaction.reply({ content: lines.join("\n"), ephemeral: true });
       }
 
-      sub.tier = tier;
-      sub.status = "approved";
-      sub.reviewedBy = interaction.user.tag;
-      sub.reviewedAt = new Date().toISOString();
 
-      const user = await client.users.fetch(sub.userId);
-      const rating = db.ratings[sub.userId] || { userId: sub.userId };
+      // Panel controls (mods) - works in /panel window, not in pinned dashboard
+      if (interaction.customId.startsWith("panel_")) {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const userId = interaction.user.id;
 
-      rating.userId = sub.userId;
-      rating.name = sub.name;
-      rating.elo = sub.elo;
-      rating.tier = tier;
-      rating.proofUrl = sub.screenshotUrl;
-      rating.avatarUrl = user.displayAvatarURL({ size: 128 });
-      rating.updatedAt = new Date().toISOString();
+        const uPanel = getUser(userId);
 
-      db.ratings[sub.userId] = rating;
-      saveDB(db);
+        // Tabs
+        if (interaction.customId === "panel_tab_config") {
+          uPanel.panelTab = "config";
+          uPanel.panelParticipantId = null;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_tab_participants") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelParticipantsPage = 0;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
 
-      await upsertCardMessage(client, rating, interaction.user.tag);
-      saveDB(db);
-      await updateIndex(client);
-      await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
-      await upsertMiniCardMessage(client, rating);
+        // Participants navigation
+        if (interaction.customId === "panel_part_prev") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelParticipantsPage = Math.max(0, (Number(uPanel.panelParticipantsPage) || 0) - 1);
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_part_next") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelParticipantsPage = (Number(uPanel.panelParticipantsPage) || 0) + 1;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_part_refresh") {
+          uPanel.panelTab = "participants";
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+        if (interaction.customId === "panel_part_back") {
+          uPanel.panelTab = "participants";
+          uPanel.panelParticipantId = null;
+          uPanel.panelDeleteTargetId = null;
+          uPanel.panelDeleteMode = null;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
 
-      await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
-      await interaction.reply({ content: "Одобрено. Тир-лист обновлён.", ephemeral: true });
+        // Step 5: View user's tierlist as PNG (same settings as main)
+        if (interaction.customId === "panel_part_view_png") {
+          const targetId = uPanel.panelParticipantId;
+          const votes = targetId ? state.finalVotes?.[targetId] : null;
+          if (!targetId || !votes || Object.keys(votes).length === 0) {
+            return interaction.reply({ content: "У этого пользователя нет сохранённого тир-листа.", ephemeral: true });
+          }
 
-      await dmUser(client, sub.userId, `Одобрено.\nELO: ${sub.elo}\nТир: ${sub.tier}\nПруф: ${sub.screenshotUrl}`);
-      await logLine(client, `APPROVE: <@${sub.userId}> ELO ${sub.elo} -> Tier ${sub.tier} (id ${submissionId}) by ${interaction.user.tag}`);
-      saveDB(db);
-      return;
-    }
+          await interaction.deferReply({ ephemeral: true });
+          const png = await renderUserFinalTierlistPng(targetId, "(его тир-лист)");
+          const attachment = new AttachmentBuilder(png, { name: "user-tierlist.png" });
 
-    // Edit ELO modal
-    if (action === "edit") {
-      const modal = new ModalBuilder().setCustomId(`edit_elo:${submissionId}`).setTitle("Edit ELO");
-      const input = new TextInputBuilder()
-        .setCustomId("elo")
-        .setLabel("Новое ELO (минимум 15)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setValue(String(sub.elo));
-      modal.addComponents(new ActionRowBuilder().addComponents(input));
-      await interaction.showModal(modal);
-      return;
-    }
+          const emb = new EmbedBuilder()
+            .setTitle("Tierlist пользователя")
+            .setDescription(`<@${targetId}>`)
+            .setImage("attachment://user-tierlist.png");
 
-    // Reject reason modal
-    if (action === "reject") {
-      const modal = new ModalBuilder().setCustomId(`reject_reason:${submissionId}`).setTitle("Reject reason");
-      const input = new TextInputBuilder()
-        .setCustomId("reason")
-        .setLabel("Причина отказа (коротко)")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(input));
-      await interaction.showModal(modal);
-      return;
-    }
-  }
+          return interaction.editReply({ embeds: [emb], files: [attachment] });
+        }
 
-  // ---- MODAL SUBMITS ----
-  if (interaction.isModalSubmit()) {
-    const [kind, submissionId] = interaction.customId.split(":");
-    const sub = db.submissions[submissionId];
+        // Step 6: Delete actions with confirm (safe delete vs full reset)
+        if (interaction.customId === "panel_part_delete_votes") {
+          const targetId = uPanel.panelParticipantId;
+          if (!targetId) return interaction.reply({ content: "Не выбран участник.", ephemeral: true });
 
-    if (!isModerator(interaction.member)) {
-      await interaction.reply({ content: "Нет прав.", ephemeral: true });
-      return;
-    }
-    if (!sub || sub.status !== "pending") {
-      await interaction.reply({ content: "Заявка не найдена или уже обработана.", ephemeral: true });
-      return;
-    }
+          uPanel.panelDeleteTargetId = targetId;
+          uPanel.panelDeleteMode = "votes";
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
 
-    if (hoursSince(sub.createdAt) > PENDING_EXPIRE_HOURS) {
-      sub.status = "expired";
-      saveDB(db);
-      const msg = await fetchReviewMessage(client, sub);
-      if (msg) await msg.edit({ embeds: [buildReviewEmbed(sub, "expired")], components: [] }).catch(() => {});
-      await interaction.reply({ content: "Заявка протухла (expired).", ephemeral: true });
-      return;
-    }
+        if (interaction.customId === "panel_part_delete_full") {
+          const targetId = uPanel.panelParticipantId;
+          if (!targetId) return interaction.reply({ content: "Не выбран участник.", ephemeral: true });
 
-    // edit_elo
-    if (kind === "edit_elo") {
-      const val = interaction.fields.getTextInputValue("elo");
-      const newElo = parseElo(val);
-      const newTier = newElo ? tierFor(newElo) : null;
+          uPanel.panelDeleteTargetId = targetId;
+          uPanel.panelDeleteMode = "full";
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
 
-      if (!newElo || !newTier) {
-        await interaction.reply({ content: "Нужно число ELO минимум 15.", ephemeral: true });
-        return;
+        if (interaction.customId === "panel_part_cancel_delete") {
+          uPanel.panelDeleteTargetId = null;
+          uPanel.panelDeleteMode = null;
+          saveState(state);
+          return interaction.update(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_part_confirm_delete") {
+          const targetId = uPanel.panelDeleteTargetId;
+          const mode = uPanel.panelDeleteMode;
+
+          if (!targetId || !mode) {
+            return interaction.reply({ content: "Нечего подтверждать.", ephemeral: true });
+          }
+
+          // perform deletion
+          if (mode === "votes") {
+            delete state.finalVotes[targetId];
+          } else if (mode === "full") {
+            delete state.finalVotes[targetId];
+            delete state.draftVotes[targetId];
+            delete state.users[targetId];
+          }
+
+          // clear pending + go back to list
+          uPanel.panelDeleteTargetId = null;
+          uPanel.panelDeleteMode = null;
+          uPanel.panelParticipantId = null;
+          saveState(state);
+
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
+
+        if (interaction.customId === "panel_close") {
+          return interaction.update({ content: "Ок.", embeds: [], components: [] });
+        }
+
+        if (interaction.customId === "panel_refresh") {
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_icon_minus" || interaction.customId === "panel_icon_plus") {
+          const step = 12;
+          applyImageDelta("icon", interaction.customId === "panel_icon_plus" ? step : -step);
+          saveState(state);
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_w_minus" || interaction.customId === "panel_w_plus") {
+          const step = 200;
+          applyImageDelta("width", interaction.customId === "panel_w_plus" ? step : -step);
+          saveState(state);
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_h_minus" || interaction.customId === "panel_h_plus") {
+          const step = 120;
+          applyImageDelta("height", interaction.customId === "panel_h_plus" ? step : -step);
+          saveState(state);
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_reset_img") {
+          resetImageOverrides();
+          saveState(state);
+          await interaction.deferUpdate();
+          await refreshDashboard(client);
+          return interaction.editReply(buildPanelPayload(userId));
+        }
+
+        if (interaction.customId === "panel_fonts") {
+          tryRegisterFonts();
+          const files = listTtfFiles();
+          const info = [
+            `ttf: ${files.length ? files.map(f => path.basename(f)).join(", ") : "(none)"}`,
+            `picked regular: ${FONT_INFO.regularFile ? path.basename(FONT_INFO.regularFile) : "(null)"}`,
+            `picked bold: ${FONT_INFO.boldFile ? path.basename(FONT_INFO.boldFile) : "(null)"}`,
+            `fallback: ${FONT_INFO.usedFallback}`
+          ].join("\n");
+          return interaction.reply({ content: info, ephemeral: true });
+        }
+
+        if (interaction.customId === "panel_rename") {
+          const tierKey = getUser(userId).panelTierKey || "S";
+          const currentName = state.tiers?.[tierKey]?.name || tierKey;
+
+          const modal = new ModalBuilder()
+            .setCustomId(`panel_rename_modal:${tierKey}`)
+            .setTitle(`Переименовать тир ${tierKey}`);
+
+          const input = new TextInputBuilder()
+            .setCustomId("tier_name")
+            .setLabel("Новое название (на картинке)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setMaxLength(24)
+            .setValue(String(currentName).slice(0, 24));
+
+          modal.addComponents(new ActionRowBuilder().addComponents(input));
+          return interaction.showModal(modal);
+        }
+
+        return interaction.reply({ content: "Неизвестная кнопка панели.", ephemeral: true });
       }
 
-      sub.elo = newElo;
-      sub.tier = newTier;
-      saveDB(db);
 
-      const msg = await fetchReviewMessage(client, sub);
-      if (msg) {
-        await msg.edit({
-          embeds: [buildReviewEmbed(sub, "pending", [{ name: "Изменено", value: `ELO исправил: ${interaction.user.tag}`, inline: false }])],
-          components: [buildReviewButtons(submissionId)],
-        }).catch(() => {});
+      if (interaction.customId === "start_rating") {
+        if (isLocked(userId)) {
+          return interaction.reply({
+            content: `Ты уже отправлял оценки. Следующая попытка после **${formatTime(u.lockUntil)}**.`,
+            ephemeral: true
+          });
+        }
+
+        // resume wizard if started
+        if (u.mainId && u.wizQueue && !wizardDone(userId)) {
+          const payload = await buildWizardPayload(userId);
+          return interaction.reply({ ...payload, ephemeral: true });
+        }
+
+        const embed = buildStartEmbed(userId);
+        const rows = [buildMainSelect(userId), buildStartButtons(userId)];
+        return interaction.reply({ embeds: [embed], components: rows, ephemeral: true });
       }
 
-      await interaction.reply({ content: `ELO обновлено: ${newElo} (тир ${newTier}).`, ephemeral: true });
-      return;
+      if (interaction.customId === "wiz_use_current_main") {
+        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!u.mainId) return interaction.reply({ content: "Сначала выбери main.", ephemeral: true });
+
+        startWizard(userId);
+        saveState(state);
+
+        await interaction.deferUpdate();
+        const payload = await buildWizardPayload(userId);
+        return interaction.editReply(payload);
+      }
+
+      if (interaction.customId === "wiz_cancel") {
+        return interaction.update({ content: "Ок.", embeds: [], components: [], files: [], attachments: [] });
+      }
+
+      if (interaction.customId === "wiz_back") {
+        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!u.wizQueue) return interaction.reply({ content: "Сначала нажми начать оценку.", ephemeral: true });
+
+        wizardBack(userId);
+        saveState(state);
+
+        await interaction.deferUpdate();
+        const payload = await buildWizardPayload(userId);
+        return interaction.editReply(payload);
+      }
+
+      if (interaction.customId.startsWith("wiz_rate_")) {
+        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!u.mainId || !u.wizQueue) return interaction.reply({ content: "Сначала выбери main.", ephemeral: true });
+        if (wizardDone(userId)) return interaction.reply({ content: "Уже всё оценено. Нажми Отправить.", ephemeral: true });
+
+        const tierKey = interaction.customId.replace("wiz_rate_", "");
+        const cid = currentWizardChar(userId);
+        if (!cid) return interaction.reply({ content: "Не удалось определить персонажа.", ephemeral: true });
+
+        setDraftTier(userId, cid, tierKey);
+        wizardNext(userId);
+        saveState(state);
+
+        await interaction.deferUpdate();
+        const payload = await buildWizardPayload(userId);
+        return interaction.editReply(payload);
+      }
+
+      if (interaction.customId === "wiz_submit") {
+        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+        if (!u.mainId || !u.wizQueue) return interaction.reply({ content: "Сначала выбери main.", ephemeral: true });
+        if (!wizardDone(userId)) return interaction.reply({ content: "Сначала оцени всех персонажей.", ephemeral: true });
+
+        await interaction.deferUpdate();
+
+        submitWizardVotes(userId);
+
+        // store influence multiplier based on tier roles at submit time
+        const inf = resolveInfluenceFromMember(interaction.member);
+        u.influenceMultiplier = inf.mult;
+        u.influenceRoleId = inf.roleId;
+        u.influenceUpdatedAt = Date.now();
+
+        u.lastSubmitAt = Date.now();
+        lockUser(userId);
+        u.wizQueue = null;
+        u.wizIndex = 0;
+        saveState(state);
+
+        await refreshDashboard(client);
+
+        const doneMsg = new EmbedBuilder()
+          .setTitle("Готово")
+          .setDescription(`Оценки сохранены. Следующая попытка после **${formatTime(getUser(userId).lockUntil)}**.`);
+
+        return interaction.editReply({ embeds: [doneMsg], components: [], files: [], attachments: [] });
+      }
     }
 
-    // reject_reason
-    if (kind === "reject_reason") {
-      const reason = interaction.fields.getTextInputValue("reason").slice(0, 800);
-
-      sub.status = "rejected";
-      sub.reviewedBy = interaction.user.tag;
-      sub.reviewedAt = new Date().toISOString();
-      sub.rejectReason = reason;
-      saveDB(db);
-
-      const msg = await fetchReviewMessage(client, sub);
-      if (msg) {
-        await msg.edit({
-          embeds: [buildReviewEmbed(sub, "rejected", [{ name: "Причина", value: reason, inline: false }])],
-          components: [],
-        }).catch(() => {});
+    // ---------------- SELECT MENUS ----------------
+    if (interaction.isStringSelectMenu()) {
+      const userId = interaction.user.id;
+      const u = getUser(userId);
+if (interaction.customId === "panel_select_tier") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const tier = interaction.values[0];
+        u.panelTierKey = tier;
+        saveState(state);
+        return interaction.update(buildPanelPayload(userId));
       }
 
-      await interaction.reply({ content: "Отклонено.", ephemeral: true });
-      await dmUser(client, sub.userId, `Отклонено.\nПричина: ${reason}\nПруф: ${sub.screenshotUrl}`);
-      await logLine(client, `REJECT: <@${sub.userId}> ELO ${sub.elo} (id ${submissionId}) by ${interaction.user.tag} | reason: ${reason}`);
-      return;
+
+      if (interaction.customId === "panel_part_select_user") {
+        if (!isModerator(interaction)) return interaction.reply({ content: "Нет прав.", ephemeral: true });
+        const targetId = interaction.values[0];
+        u.panelTab = "participants";
+        u.panelParticipantId = targetId;
+        u.panelDeleteTargetId = null;
+        u.panelDeleteMode = null;
+        saveState(state);
+        return interaction.update(buildPanelPayload(userId));
+      }
+
+      if (interaction.customId === "select_main") {
+        if (isLocked(userId)) return interaction.reply({ content: `Заблокировано до **${formatTime(u.lockUntil)}**.`, ephemeral: true });
+
+        const mainId = interaction.values[0];
+        setMain(userId, mainId);
+        startWizard(userId);
+        saveState(state);
+
+        await interaction.deferUpdate();
+        const payload = await buildWizardPayload(userId);
+        return interaction.editReply(payload);
+      }
+    }
+  } catch (e) {
+    console.error(e);
+    if (interaction.isRepliable()) {
+      return safeRespond(interaction, { content: `Ошибка: ${e?.message || "unknown"}`, ephemeral: true });
     }
   }
 });
+
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
 client.login(DISCORD_TOKEN);
