@@ -115,10 +115,10 @@ function isImageAttachment(att) {
   return url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp") || url.endsWith(".gif");
 }
 
-// Тиры "ОТ": 15 / 35 / 60 / 90 / 120 (ниже 15 — невалидно)
+// Тиры "ОТ": 10 / 20 / 40 / 70 / 110 (ниже 10 — невалидно)
 function tierFor(elo) {
   if (elo >= 110) return 5;
-  if (elo >= 80) return 4;
+  if (elo >= 70) return 4;
   if (elo >= 40) return 3;
   if (elo >= 20) return 2;
   if (elo >= 10) return 1;
@@ -1174,44 +1174,82 @@ async function fetchReviewMessage(client, sub) {
   return msg;
 }
 
+async function supersedePendingSubmissionsForUser(client, userId, moderatorTag) {
+  let changed = 0;
+  for (const sub of Object.values(db.submissions || {})) {
+    if (!sub || sub.userId !== userId || sub.status !== "pending") continue;
+    sub.status = "superseded";
+    sub.reviewedBy = moderatorTag;
+    sub.reviewedAt = new Date().toISOString();
+    sub.rejectReason = "Добавлено/обновлено модератором напрямую";
+    changed++;
+    const msg = await fetchReviewMessage(client, sub);
+    if (msg) {
+      await msg.edit({
+        embeds: [buildReviewEmbed(sub, "superseded", [{ name: "Причина", value: sub.rejectReason, inline: false }])],
+        components: [],
+      }).catch(() => {});
+    }
+  }
+  if (changed) saveDB(db);
+  return changed;
+}
+
+async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawText, moderatorTag) {
+  if (!targetUser) throw new Error("target user is required");
+  if (!screenshotAttachment || !isImageAttachment(screenshotAttachment)) {
+    throw new Error("Нужен скрин-картинка.");
+  }
+
+  const elo = parseElo(rawText);
+  const tier = elo ? tierFor(elo) : null;
+  if (!elo || !tier) {
+    throw new Error("Нужно число ELO минимум 10.");
+  }
+
+  const guild = await getGuild(client).catch(() => null);
+  const member = guild ? await guild.members.fetch(targetUser.id).catch(() => null) : null;
+  const rating = db.ratings[targetUser.id] || { userId: targetUser.id };
+
+  rating.userId = targetUser.id;
+  rating.name = member?.displayName || targetUser.username;
+  rating.username = targetUser.username;
+  rating.elo = elo;
+  rating.tier = tier;
+  rating.proofUrl = screenshotAttachment.url;
+  rating.avatarUrl = normalizeDiscordAvatarUrl(
+    (member?.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 })) ||
+    targetUser.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }) ||
+    targetUser.defaultAvatarURL ||
+    ""
+  );
+  rating.updatedAt = new Date().toISOString();
+
+  db.ratings[targetUser.id] = rating;
+  saveDB(db);
+
+  await loadGraphicAvatarForPlayer(client, rating).catch(() => null);
+  await upsertCardMessage(client, rating, moderatorTag);
+  await updateIndex(client);
+  await refreshGraphicTierlist(client).catch(() => false);
+  await ensureSingleTierRole(client, targetUser.id, tier, "Manual tier set by moderator");
+  await supersedePendingSubmissionsForUser(client, targetUser.id, moderatorTag);
+  saveDB(db);
+
+  return rating;
+}
+
 
 // ====== MINI CARDS (SUBMIT CHANNEL) ======
-// Маленькие "карточки" в канале подачи (#elo-submit): кто сейчас в тир-листе.
-// Требование: очень компактно, без картинок, без полей.
-function buildMiniCardEmbed(rating) {
-  return new EmbedBuilder()
-    .setDescription(`✅ **${rating.name}** добавлен в тир-лист.`);
+// Отключено: в канале подачи больше не создаём карточки.
+function buildMiniCardEmbed() {
+  return null;
 }
 
 async function upsertMiniCardMessage(client, rating) {
-  if (!SUBMIT_CHANNEL_ID) return { changed: false };
-  const ch = await client.channels.fetch(SUBMIT_CHANNEL_ID).catch(() => null);
-  if (!ch?.isTextBased()) return { changed: false };
-
-  const embed = buildMiniCardEmbed(rating);
-  const existingId = (db.miniCards || {})[rating.userId];
-
-  if (existingId) {
-    try {
-      const msg = await ch.messages.fetch(existingId);
-      await msg.edit({ embeds: [embed] }).catch(() => {});
-      return { changed: false };
-    } catch {
-      // сообщение удалено/недоступно — пересоздадим
-      db.miniCards[rating.userId] = "";
-      saveDB(db);
-    }
-  }
-
-  const msg = await ch.send({ embeds: [embed] }).catch(() => null);
-  if (!msg) return { changed: false };
-
-  // можно закреплять, чтобы "висело" (если лимит закрепов — просто проигнорит)
-  try { await msg.pin(); } catch {}
-
-  db.miniCards[rating.userId] = msg.id;
-  saveDB(db);
-  return { changed: true };
+  void client;
+  void rating;
+  return { changed: false };
 }
 
 async function deleteMiniCardMessage(client, userId) {
@@ -1237,28 +1275,16 @@ async function deleteMiniCardMessage(client, userId) {
 
 async function syncMiniCards(client) {
   db.miniCards ||= {};
-  const wantIds = new Set(Object.keys(db.ratings || {}));
-
-  let created = 0;
   let removed = 0;
 
-  // создать/починить отсутствующие
-  for (const uid of wantIds) {
-    const r = db.ratings[uid];
-    if (!r) continue;
-    const had = Boolean(db.miniCards[uid]);
-    const res = await upsertMiniCardMessage(client, r);
-    if (!had && res.changed) created++;
-  }
-
-  // удалить лишние (кто уже не в тир-листе)
   for (const uid of Object.keys(db.miniCards)) {
-    if (wantIds.has(uid)) continue;
     const ok = await deleteMiniCardMessage(client, uid);
     if (ok) removed++;
   }
 
-  return { created, removed, total: wantIds.size };
+  db.miniCards = {};
+  saveDB(db);
+  return { created: 0, removed, total: Object.keys(db.ratings || {}).length };
 }
 
 
@@ -1397,6 +1423,10 @@ function buildCommands() {
       .addSubcommand(s => s.setName("graphicpanel").setDescription("Панель PNG тир-листа (модеры)"))
       .addSubcommand(s => s.setName("remove").setDescription("Удалить игрока из тир-листа (модеры)")
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
+      .addSubcommand(s => s.setName("modset").setDescription("Добавить или обновить игрока напрямую (модеры)")
+        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true))
+        .addAttachmentOption(o => o.setName("screenshot").setDescription("Скрин-пруф").setRequired(true))
+        .addStringOption(o => o.setName("text").setDescription("Текст после юзернейма, из него берётся ELO").setRequired(true)))
       .addSubcommand(s => s.setName("wipe").setDescription("Очистить рейтинг полностью (модеры)")
         .addStringOption(o => o.setName("mode").setDescription("soft=только база, hard=база+удалить карточки").setRequired(true)
           .addChoices(
@@ -1410,7 +1440,6 @@ function buildCommands() {
         .addStringOption(o => o.setName("t3").setDescription("Название тира 3").setRequired(true))
         .addStringOption(o => o.setName("t4").setDescription("Название тира 4").setRequired(true))
         .addStringOption(o => o.setName("t5").setDescription("Название тира 5").setRequired(true)))
-      .addSubcommand(s => s.setName("minicards").setDescription("Пересоздать мини-карточки в submit (модеры)"))
   ].map(c => c.toJSON());
 }
 
@@ -1679,16 +1708,28 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // /elo minicards
-    if (sub === "minicards") {
-      const res = await syncMiniCards(client);
-      await interaction.reply({
-        content: `Мини-карточки: создано ${res.created}, удалено ${res.removed}, всего в тир-листе ${res.total}.`,
-        ephemeral: true,
-      });
+    // /elo modset
+    if (sub === "modset") {
+      const target = interaction.options.getUser("target", true);
+      const screenshot = interaction.options.getAttachment("screenshot", true);
+      const rawText = interaction.options.getString("text", true);
+
+      try {
+        const rating = await upsertRatingDirect(client, target, screenshot, rawText, interaction.user.tag);
+        await interaction.reply({
+          content: `Ок. <@${target.id}> теперь в тир-листе. ELO **${rating.elo}**, тир **${rating.tier}**.`,
+          ephemeral: true,
+        });
+        await dmUser(client, target.id, `Модератор обновил твой рейтинг.
+ELO: ${rating.elo}
+Тир: ${rating.tier}
+Пруф: ${rating.proofUrl}`);
+        await logLine(client, `MODSET: <@${target.id}> ELO ${rating.elo} -> Tier ${rating.tier} by ${interaction.user.tag}`);
+      } catch (err) {
+        await interaction.reply({ content: String(err?.message || err || "Не удалось добавить игрока."), ephemeral: true });
+      }
       return;
     }
-
 
     // /elo labels
     if (sub === "labels") {
@@ -1994,14 +2035,14 @@ client.on("interactionCreate", async (interaction) => {
         sub.status = "rejected";
         sub.reviewedBy = interaction.user.tag;
         sub.reviewedAt = new Date().toISOString();
-        sub.rejectReason = "ELO ниже 15";
+        sub.rejectReason = "ELO ниже 10";
         saveDB(db);
 
         await interaction.message.edit({
           embeds: [buildReviewEmbed(sub, "rejected", [{ name: "Причина", value: sub.rejectReason, inline: false }])],
           components: [],
         }).catch(() => {});
-        await interaction.reply({ content: "ELO ниже 15. Отклонено.", ephemeral: true });
+        await interaction.reply({ content: "ELO ниже 10. Отклонено.", ephemeral: true });
         return;
       }
 
@@ -2033,7 +2074,6 @@ client.on("interactionCreate", async (interaction) => {
       await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
-      await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён. PNG тоже обновлён, если был настроен.", ephemeral: true });
@@ -2049,7 +2089,7 @@ client.on("interactionCreate", async (interaction) => {
       const modal = new ModalBuilder().setCustomId(`edit_elo:${submissionId}`).setTitle("Edit ELO");
       const input = new TextInputBuilder()
         .setCustomId("elo")
-        .setLabel("Новое ELO (минимум 15)")
+        .setLabel("Новое ELO (минимум 10)")
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(String(sub.elo));
@@ -2166,7 +2206,7 @@ client.on("interactionCreate", async (interaction) => {
       const newTier = newElo ? tierFor(newElo) : null;
 
       if (!newElo || !newTier) {
-        await interaction.reply({ content: "Нужно число ELO минимум 15.", ephemeral: true });
+        await interaction.reply({ content: "Нужно число ELO минимум 10.", ephemeral: true });
         return;
       }
 
