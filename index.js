@@ -401,6 +401,7 @@ function buildGraphicBucketsFromRatings() {
     buckets[tier].push({
       userId: raw.userId,
       name: raw.name || raw.userId,
+      username: raw.username || raw.name || raw.userId,
       elo: Number(raw.elo) || 0,
       tier,
       avatarUrl: normalizeDiscordAvatarUrl(raw.avatarUrl || "")
@@ -410,7 +411,7 @@ function buildGraphicBucketsFromRatings() {
   for (const t of Object.keys(buckets)) {
     buckets[t].sort((a, b) => {
       if ((b.elo || 0) !== (a.elo || 0)) return (b.elo || 0) - (a.elo || 0);
-      return String(a.name || "").localeCompare(String(b.name || ""), "ru");
+      return String(a.username || a.name || "").localeCompare(String(b.username || b.name || ""), "ru");
     });
   }
 
@@ -525,6 +526,74 @@ async function loadGraphicAvatar(url) {
   return img || null;
 }
 
+function setGraphicFont(ctx, size, weight = 'regular') {
+  const family = weight === 'bold' ? GRAPHIC_FONT_BOLD : GRAPHIC_FONT_REG;
+  ctx.font = `${Math.max(8, Math.floor(size))}px '${family}'`;
+}
+
+function measureGraphicTextWidth(ctx, text, size, weight = 'regular') {
+  const value = String(text ?? '');
+  setGraphicFont(ctx, size, weight);
+  try {
+    const measured = ctx.measureText(value);
+    if (measured && Number.isFinite(measured.width)) return measured.width;
+  } catch {}
+  return value.length * size * (weight === 'bold' ? 0.64 : 0.58);
+}
+
+function fitGraphicSingleLine(ctx, text, maxWidth, maxSize, minSize, weight = 'regular') {
+  const source = String(text ?? '').trim() || 'unknown';
+  let size = Math.max(minSize, maxSize);
+  while (size > minSize && measureGraphicTextWidth(ctx, source, size, weight) > maxWidth) size -= 1;
+
+  let fitted = source;
+  if (measureGraphicTextWidth(ctx, fitted, size, weight) > maxWidth) {
+    const ellipsis = '…';
+    while (fitted.length > 1 && measureGraphicTextWidth(ctx, fitted + ellipsis, size, weight) > maxWidth) {
+      fitted = fitted.slice(0, -1);
+    }
+    fitted = fitted.length < source.length ? (fitted + ellipsis) : fitted;
+  }
+
+  return { text: fitted, size };
+}
+
+function centerGraphicTextX(ctx, text, x, width, size, weight = 'regular') {
+  const measured = measureGraphicTextWidth(ctx, text, size, weight);
+  return x + Math.max(0, Math.floor((width - measured) / 2));
+}
+
+function drawGraphicTextOutline(ctx, text, x, y, options = {}) {
+  const fill = options.fill || 'rgba(255,255,255,0.98)';
+  const outline = options.outline || 'rgba(0,0,0,0.98)';
+  const radius = Math.max(1, options.radius || 2);
+  ctx.fillStyle = outline;
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dy = -radius; dy <= radius; dy++) {
+      if (dx === 0 && dy === 0) continue;
+      ctx.fillText(text, x + dx, y + dy);
+    }
+  }
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+}
+
+async function hydrateGraphicUsernames(client) {
+  let changed = 0;
+  for (const rating of Object.values(db.ratings || {})) {
+    if (!rating?.userId) continue;
+    try {
+      const user = await client.users.fetch(rating.userId);
+      if (user?.username && rating.username !== user.username) {
+        rating.username = user.username;
+        changed++;
+      }
+    } catch {}
+  }
+  if (changed) saveDB(db);
+  return changed;
+}
+
 async function renderGraphicTierlistPng() {
   if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
   ensureGraphicFonts();
@@ -538,7 +607,7 @@ async function renderGraphicTierlistPng() {
   const leftW = Math.floor(W * 0.24);
   const rightPadding = 36;
   const gap = Math.max(10, Math.floor(ICON * 0.16));
-  const overlayH = Math.max(24, Math.floor(ICON * 0.24));
+  const overlayH = Math.max(24, Math.floor(ICON * 0.26));
   const rightW = W - leftW - rightPadding - 24;
   const cols = Math.max(1, Math.floor((rightW + gap) / (ICON + gap)));
 
@@ -584,11 +653,13 @@ async function renderGraphicTierlistPng() {
 
     const blockH = rowH - 12;
     fillColor(ctx, '#111111');
-    ctx.font = `56px '${GRAPHIC_FONT_BOLD}'`;
-    ctx.fillText(formatTierTitle(tierKey), 40 + 70, y + Math.floor(blockH / 2) + 18);
+    const tierTitle = formatTierTitle(tierKey);
+    const tierTitleFit = fitGraphicSingleLine(ctx, tierTitle, leftW - 130, 56, 26, 'bold');
+    setGraphicFont(ctx, tierTitleFit.size, 'bold');
+    ctx.fillText(tierTitleFit.text, 40 + 70, y + Math.floor(blockH / 2) + Math.floor(tierTitleFit.size * 0.34));
 
     fillColor(ctx, '#111111');
-    ctx.font = `24px '${GRAPHIC_FONT_REG}'`;
+    setGraphicFont(ctx, 24, 'regular');
     ctx.fillText(`TIER ${tierKey}`, 40 + 70, y + blockH - 18);
 
     const list = buckets[tierKey] || [];
@@ -614,13 +685,22 @@ async function renderGraphicTierlistPng() {
         ctx.fillRect(x, yy, ICON, ICON);
       }
 
-      ctx.fillStyle = 'rgba(0,0,0,0.72)';
+      const usernameText = String(player.username || player.name || player.userId || 'user').trim() || 'user';
+      const usernameFit = fitGraphicSingleLine(ctx, usernameText, ICON - 10, Math.max(14, Math.floor(ICON * 0.16)), 9, 'bold');
+      ctx.fillStyle = 'rgba(0,0,0,0.78)';
       ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
       ctx.fillStyle = 'rgba(255,255,255,0.96)';
-      ctx.font = `24px '${GRAPHIC_FONT_BOLD}'`;
+      setGraphicFont(ctx, usernameFit.size, 'bold');
+      const usernameX = centerGraphicTextX(ctx, usernameFit.text, x, ICON, usernameFit.size, 'bold');
+      const usernameY = yy + ICON - Math.max(6, Math.floor((overlayH - usernameFit.size) / 2) - 1);
+      ctx.fillText(usernameFit.text, usernameX, usernameY);
+
       const eloText = String(player.elo || 0);
-      const tx = x + Math.max(8, Math.floor((ICON - (eloText.length * 14)) / 2));
-      ctx.fillText(eloText, tx, yy + ICON - 8);
+      const eloFit = fitGraphicSingleLine(ctx, eloText, Math.floor(ICON * 0.48), Math.max(20, Math.floor(ICON * 0.22)), 12, 'bold');
+      const eloX = x + ICON - 8 - measureGraphicTextWidth(ctx, eloFit.text, eloFit.size, 'bold');
+      const eloY = yy + 10 + eloFit.size;
+      setGraphicFont(ctx, eloFit.size, 'bold');
+      drawGraphicTextOutline(ctx, eloFit.text, eloX, eloY, { fill: 'rgba(255,255,255,0.98)', outline: 'rgba(0,0,0,0.98)', radius: 2 });
     }
   }
 
@@ -652,6 +732,7 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
     try { msg = await channel.messages.fetch(state.dashboardMessageId); } catch {}
   }
 
+  await hydrateGraphicUsernames(client).catch(() => 0);
   const png = await renderGraphicTierlistPng();
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -693,6 +774,7 @@ async function refreshGraphicTierlist(client) {
     return true;
   }
 
+  await hydrateGraphicUsernames(client).catch(() => 0);
   const png = await renderGraphicTierlistPng();
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -1754,6 +1836,7 @@ if (sub === "modset") {
 
       rating.userId = sub.userId;
       rating.name = sub.name;
+      rating.username = user.username;
       rating.elo = sub.elo;
       rating.tier = tier;
       rating.proofUrl = sub.screenshotUrl;
