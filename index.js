@@ -117,11 +117,11 @@ function isImageAttachment(att) {
 
 // Тиры "ОТ": 15 / 35 / 60 / 90 / 120 (ниже 15 — невалидно)
 function tierFor(elo) {
-  if (elo >= 120) return 5;
-  if (elo >= 90) return 4;
-  if (elo >= 60) return 3;
-  if (elo >= 35) return 2;
-  if (elo >= 15) return 1;
+  if (elo >= 110) return 5;
+  if (elo >= 80) return 4;
+  if (elo >= 40) return 3;
+  if (elo >= 20) return 2;
+  if (elo >= 10) return 1;
   return null;
 }
 
