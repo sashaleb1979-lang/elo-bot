@@ -41,6 +41,8 @@ const PENDING_EXPIRE_HOURS = 48;     // протухание pending
 // TODO: ВПИШИ СВОИ НАЗВАНИЯ ТИРОВ ТУТ (пока цифры)
 // (можно менять через /elo labels тоже)
 const DEFAULT_TIER_LABELS = { 1: "1", 2: "2", 3: "3", 4: "4", 5: "5" };
+const DEFAULT_GRAPHIC_MESSAGE_TEXT = "Главное отображение ELO тир-листа. Текстовый tierlist-канал больше не используется.";
+const DISABLE_TEXT_TIERLIST = true; // stage 2: текстовый tierlist-канал полностью выведен из работы
 
 // ====== DB (файл) ======
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "db.json");
@@ -84,11 +86,13 @@ db.config.graphicTierlist ||= {
   },
   panel: {
     selectedTier: 5
-  }
+  },
+  messageText: DEFAULT_GRAPHIC_MESSAGE_TEXT
 };
 db.config.graphicTierlist.image ||= { width: null, height: null, icon: null };
 db.config.graphicTierlist.tierColors ||= { 5: "#ff6b6b", 4: "#ff9f43", 3: "#feca57", 2: "#1dd1a1", 1: "#54a0ff" };
 db.config.graphicTierlist.panel ||= { selectedTier: 5 };
+if (!db.config.graphicTierlist.messageText) db.config.graphicTierlist.messageText = DEFAULT_GRAPHIC_MESSAGE_TEXT;
 if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
 if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
 saveDB(db);
@@ -115,12 +119,12 @@ function isImageAttachment(att) {
   return url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp") || url.endsWith(".gif");
 }
 
-// Тиры "ОТ": 10 / 25 / 45 / 80 / 110 (ниже 10 — невалидно)
+// Тиры "ОТ": 10 / 20 / 40 / 70 / 110 (ниже 10 — невалидно)
 function tierFor(elo) {
   if (elo >= 110) return 5;
-  if (elo >= 80) return 4;
-  if (elo >= 45) return 3;
-  if (elo >= 25) return 2;
+  if (elo >= 70) return 4;
+  if (elo >= 40) return 3;
+  if (elo >= 20) return 2;
   if (elo >= 10) return 1;
   return null;
 }
@@ -144,12 +148,17 @@ function sanitizeFileName(name, fallbackExt = "png") {
 }
 
 async function downloadToBuffer(url, timeoutMs = 15000) {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 ChatGPTBot/1.0",
+    "Accept": "image/avif,image/webp,image/apng,image/png,image/jpeg,*/*;q=0.8"
+  };
+
   // 1) Node 18+: используем fetch
   if (typeof fetch === "function") {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { signal: controller.signal });
+      const res = await fetch(url, { signal: controller.signal, headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const ab = await res.arrayBuffer();
       return Buffer.from(ab);
@@ -161,7 +170,7 @@ async function downloadToBuffer(url, timeoutMs = 15000) {
   // 2) Fallback (Node 16/17): качаем через http/https
   return await new Promise((resolve, reject) => {
     const lib = url.startsWith("https:") ? https : http;
-    const req = lib.get(url, (res) => {
+    const req = lib.get(url, { headers }, (res) => {
       // редиректы
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -283,8 +292,43 @@ const DEFAULT_GRAPHIC_TIER_COLORS = {
 let graphicFontsReady = false;
 let GRAPHIC_FONT_REG = "GraphicFontRegular";
 let GRAPHIC_FONT_BOLD = "GraphicFontBold";
-let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false };
+let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false, source: "none", loadError: null };
 const graphicAvatarCache = new Map();
+const GRAPHIC_AVATAR_DISK_DIR = process.env.GRAPHIC_AVATAR_CACHE_DIR || path.join(__dirname, 'graphic_avatar_cache');
+
+function ensureGraphicAvatarDiskDir() {
+  try { fs.mkdirSync(GRAPHIC_AVATAR_DISK_DIR, { recursive: true }); } catch {}
+}
+
+function getGraphicAvatarDiskPath(userId) {
+  ensureGraphicAvatarDiskDir();
+  return path.join(GRAPHIC_AVATAR_DISK_DIR, `${String(userId || 'unknown')}.png`);
+}
+
+async function loadGraphicAvatarFromDisk(userId) {
+  if (!userId) return null;
+  const fp = getGraphicAvatarDiskPath(userId);
+  if (!fs.existsSync(fp)) return null;
+  try {
+    const buf = fs.readFileSync(fp);
+    const img = await decodeImageFromBuffer(buf);
+    if (!img) return null;
+    graphicAvatarCache.set(`disk:${userId}`, img);
+    return img;
+  } catch {
+    return null;
+  }
+}
+
+function saveGraphicAvatarBufferToDisk(userId, buf) {
+  if (!userId || !buf?.length) return false;
+  try {
+    fs.writeFileSync(getGraphicAvatarDiskPath(userId), buf);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function getGraphicTierlistState() {
   db.config.graphicTierlist ||= {
@@ -296,11 +340,13 @@ function getGraphicTierlistState() {
     tierColors: { ...DEFAULT_GRAPHIC_TIER_COLORS },
     panel: {
       selectedTier: 5
-    }
+    },
+    messageText: DEFAULT_GRAPHIC_MESSAGE_TEXT
   };
   db.config.graphicTierlist.image ||= { width: null, height: null, icon: null };
   db.config.graphicTierlist.tierColors ||= { ...DEFAULT_GRAPHIC_TIER_COLORS };
   db.config.graphicTierlist.panel ||= { selectedTier: 5 };
+  if (!db.config.graphicTierlist.messageText) db.config.graphicTierlist.messageText = DEFAULT_GRAPHIC_MESSAGE_TEXT;
   if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
   if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) {
     db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
@@ -309,6 +355,27 @@ function getGraphicTierlistState() {
     if (!db.config.graphicTierlist.tierColors[t]) db.config.graphicTierlist.tierColors[t] = DEFAULT_GRAPHIC_TIER_COLORS[t];
   }
   return db.config.graphicTierlist;
+}
+
+function getGraphicMessageText() {
+  const state = getGraphicTierlistState();
+  const raw = String(state.messageText ?? DEFAULT_GRAPHIC_MESSAGE_TEXT).trim();
+  return raw || DEFAULT_GRAPHIC_MESSAGE_TEXT;
+}
+
+function previewGraphicMessageText(max = 220) {
+  const text = getGraphicMessageText().replace(/\s+/g, ' ').trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+}
+
+function getGraphicDashboardEmbedDescription() {
+  return getGraphicMessageText();
+}
+
+function getGraphicMessageTextModalValue() {
+  const text = getGraphicMessageText();
+  return text.length <= 4000 ? text : text.slice(0, 4000);
 }
 
 function getGraphicImageConfig() {
@@ -346,16 +413,29 @@ function resetGraphicImageOverrides() {
   state.image.icon = null;
 }
 
+function isDiscordCdnUrl(url) {
+  if (!url) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "cdn.discordapp.com" || host === "media.discordapp.net";
+  } catch {
+    return false;
+  }
+}
+
 function normalizeDiscordAvatarUrl(url) {
   if (!url) return "";
   try {
     const u = new URL(url);
+    if (!isDiscordCdnUrl(u.toString())) return u.toString();
     const file = u.pathname || "";
     u.pathname = file.replace(/\.(webp|gif|jpg|jpeg)$/i, ".png");
     u.searchParams.set("size", "256");
+    u.searchParams.delete("width");
+    u.searchParams.delete("height");
     return u.toString();
   } catch {
-    return String(url).replace(/\.(webp|gif|jpg|jpeg)(\?.*)?$/i, ".png$2");
+    return String(url);
   }
 }
 
@@ -389,6 +469,13 @@ function resetAllGraphicTierColors() {
 
 function clearGraphicAvatarCache() {
   graphicAvatarCache.clear();
+  try {
+    if (fs.existsSync(GRAPHIC_AVATAR_DISK_DIR)) {
+      for (const f of fs.readdirSync(GRAPHIC_AVATAR_DISK_DIR)) {
+        try { fs.unlinkSync(path.join(GRAPHIC_AVATAR_DISK_DIR, f)); } catch {}
+      }
+    }
+  } catch {}
 }
 
 function buildGraphicBucketsFromRatings() {
@@ -401,7 +488,7 @@ function buildGraphicBucketsFromRatings() {
     buckets[tier].push({
       userId: raw.userId,
       name: raw.name || raw.userId,
-      username: raw.username || raw.name || raw.userId,
+      username: String(raw.username || "").trim() || raw.name || raw.userId,
       elo: Number(raw.elo) || 0,
       tier,
       avatarUrl: normalizeDiscordAvatarUrl(raw.avatarUrl || "")
@@ -411,7 +498,7 @@ function buildGraphicBucketsFromRatings() {
   for (const t of Object.keys(buckets)) {
     buckets[t].sort((a, b) => {
       if ((b.elo || 0) !== (a.elo || 0)) return (b.elo || 0) - (a.elo || 0);
-      return String(a.username || a.name || "").localeCompare(String(b.username || b.name || ""), "ru");
+      return String(a.name || "").localeCompare(String(b.name || ""), "ru");
     });
   }
 
@@ -441,31 +528,34 @@ function listGraphicFontFiles() {
 function pickGraphicFontFiles() {
   const preferredPairs = [
     [
-      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
-      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf")
-    ],
-    [
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+      "system-dejavu"
     ],
     [
       "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+      "system-liberation"
     ],
+    [
+      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
+      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf"),
+      "repo-assets"
+    ]
   ];
 
-  for (const [regularFile, boldFile] of preferredPairs) {
+  for (const [regularFile, boldFile, source] of preferredPairs) {
     if (fs.existsSync(regularFile) && fs.existsSync(boldFile)) {
-      return { regularFile, boldFile, usedFallback: false };
+      return { regularFile, boldFile, usedFallback: false, source, loadError: null };
     }
   }
 
   const any = listGraphicFontFiles();
   if (any.length) {
-    return { regularFile: any[0], boldFile: any[0], usedFallback: true };
+    return { regularFile: any[0], boldFile: any[0], usedFallback: true, source: "any-ttf", loadError: null };
   }
 
-  return { regularFile: null, boldFile: null, usedFallback: true };
+  return { regularFile: null, boldFile: null, usedFallback: true, source: "none", loadError: "No TTF fonts found" };
 }
 
 function ensureGraphicFonts() {
@@ -475,13 +565,170 @@ function ensureGraphicFonts() {
   const picked = pickGraphicFontFiles();
   GRAPHIC_FONT_INFO = picked;
 
-  try {
-    if (picked.regularFile) PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
-    if (picked.boldFile) PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
-  } catch {}
+  if (!picked.regularFile || !picked.boldFile) {
+    graphicFontsReady = false;
+    return false;
+  }
 
-  graphicFontsReady = true;
-  return true;
+  try {
+    PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
+    PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
+    GRAPHIC_FONT_INFO.loadError = null;
+    graphicFontsReady = true;
+    return true;
+  } catch (err) {
+    GRAPHIC_FONT_INFO.loadError = String(err?.message || err || "font load failed");
+    graphicFontsReady = false;
+    return false;
+  }
+}
+
+function setGraphicFont(ctx, px, kind = "regular") {
+  const family = kind === "bold" ? GRAPHIC_FONT_BOLD : GRAPHIC_FONT_REG;
+  ctx.font = `${Math.max(1, Math.floor(px))}px ${family}`;
+}
+
+function measureGraphicTextWidth(ctx, text) {
+  try {
+    return Number(ctx.measureText(String(text || "")).width) || 0;
+  } catch {
+    return String(text || "").length * 12;
+  }
+}
+
+function centerGraphicTextX(ctx, text, left, width) {
+  const tw = measureGraphicTextWidth(ctx, text);
+  return Math.floor(left + Math.max(0, (width - tw) / 2));
+}
+
+function wrapGraphicTextLines(ctx, text, maxWidth, maxLines = 3) {
+  const source = String(text || "").trim();
+  if (!source) return [""];
+
+  const out = [];
+  const words = source.split(/\s+/).filter(Boolean);
+
+  function pushWordSmart(word) {
+    if (measureGraphicTextWidth(ctx, word) <= maxWidth) {
+      out.push(word);
+      return;
+    }
+
+    let chunk = "";
+    for (const ch of word) {
+      const candidate = chunk + ch;
+      if (!chunk || measureGraphicTextWidth(ctx, candidate) <= maxWidth) {
+        chunk = candidate;
+      } else {
+        out.push(chunk);
+        chunk = ch;
+      }
+    }
+    if (chunk) out.push(chunk);
+  }
+
+  const pieces = [];
+  for (const word of words) {
+    if (measureGraphicTextWidth(ctx, word) <= maxWidth) pieces.push(word);
+    else {
+      let chunk = "";
+      for (const ch of word) {
+        const candidate = chunk + ch;
+        if (!chunk || measureGraphicTextWidth(ctx, candidate) <= maxWidth) chunk = candidate;
+        else {
+          pieces.push(chunk);
+          chunk = ch;
+        }
+      }
+      if (chunk) pieces.push(chunk);
+    }
+  }
+
+  let line = "";
+  for (const part of pieces) {
+    const candidate = line ? `${line} ${part}` : part;
+    if (!line || measureGraphicTextWidth(ctx, candidate) <= maxWidth) {
+      line = candidate;
+      continue;
+    }
+    out.push(line);
+    line = part;
+  }
+  if (line) out.push(line);
+
+  if (out.length <= maxLines) return out;
+
+  const trimmed = out.slice(0, maxLines);
+  let last = trimmed[maxLines - 1];
+  while (last.length > 1 && measureGraphicTextWidth(ctx, `${last}…`) > maxWidth) {
+    last = last.slice(0, -1).trimEnd();
+  }
+  trimmed[maxLines - 1] = `${last}…`;
+  return trimmed;
+}
+
+function fitGraphicWrappedText(ctx, text, kind, maxWidth, maxHeight, startPx, minPx = 22, maxLines = 3) {
+  for (let px = startPx; px >= minPx; px -= 2) {
+    setGraphicFont(ctx, px, kind);
+    const lines = wrapGraphicTextLines(ctx, text, maxWidth, maxLines);
+    const lineH = Math.max(px + 4, Math.floor(px * 1.15));
+    const totalH = lines.length * lineH;
+    const widest = Math.max(...lines.map(line => measureGraphicTextWidth(ctx, line)), 0);
+    if (widest <= maxWidth && totalH <= maxHeight) {
+      return { px, lines, lineH, totalH };
+    }
+  }
+
+  setGraphicFont(ctx, minPx, kind);
+  const lines = wrapGraphicTextLines(ctx, text, maxWidth, maxLines);
+  const lineH = Math.max(minPx + 4, Math.floor(minPx * 1.15));
+  return { px: minPx, lines, lineH, totalH: lines.length * lineH };
+}
+
+function trimGraphicTextToWidth(ctx, text, maxWidth) {
+  let out = String(text || "").trim();
+  if (!out) return "";
+  if (measureGraphicTextWidth(ctx, out) <= maxWidth) return out;
+  while (out.length > 1 && measureGraphicTextWidth(ctx, `${out}…`) > maxWidth) {
+    out = out.slice(0, -1).trimEnd();
+  }
+  return out.length ? `${out}…` : "";
+}
+
+function fitGraphicSingleLineText(ctx, text, kind, maxWidth, startPx, minPx = 10) {
+  const source = String(text || "").trim();
+  if (!source) return { px: minPx, text: "" };
+
+  for (let px = startPx; px >= minPx; px -= 1) {
+    setGraphicFont(ctx, px, kind);
+    if (measureGraphicTextWidth(ctx, source) <= maxWidth) return { px, text: source };
+  }
+
+  setGraphicFont(ctx, minPx, kind);
+  return { px: minPx, text: trimGraphicTextToWidth(ctx, source, maxWidth) };
+}
+
+function drawGraphicOutlinedText(ctx, text, x, y, fill = "#ffffff", outline = "#000000") {
+  const offsets = [
+    [-2, 0], [2, 0], [0, -2], [0, 2],
+    [-1, -1], [1, -1], [-1, 1], [1, 1]
+  ];
+  ctx.fillStyle = outline;
+  for (const [dx, dy] of offsets) ctx.fillText(text, x + dx, y + dy);
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+}
+
+function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
+  const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
+  fillColor(ctx, '#111111');
+  setGraphicFont(ctx, fit.px, 'bold');
+
+  let y = Math.floor(boxY + Math.max(0, (boxH - fit.totalH) / 2)) + fit.px;
+  for (const line of fit.lines) {
+    ctx.fillText(line, boxX, y);
+    y += fit.lineH;
+  }
 }
 
 function hexToRgb(hex) {
@@ -512,91 +759,144 @@ async function decodeImageFromBuffer(buf) {
   return null;
 }
 
-async function loadGraphicAvatar(url) {
-  if (!url) return null;
-  if (graphicAvatarCache.has(url)) return graphicAvatarCache.get(url);
+async function fetchGraphicAvatarFromUrl(url) {
+  const normalized = normalizeDiscordAvatarUrl(url || "");
+  if (!normalized) return { img: null, buf: null, url: "" };
+  const cacheHit = graphicAvatarCache.get(normalized);
+  if (cacheHit) return { img: cacheHit, buf: null, url: normalized };
 
-  let img = null;
   try {
-    const buf = await downloadToBuffer(url, 15000);
-    img = await decodeImageFromBuffer(buf);
+    const buf = await downloadToBuffer(normalized, 15000);
+    const img = await decodeImageFromBuffer(buf);
+    if (img) {
+      graphicAvatarCache.set(normalized, img);
+      return { img, buf, url: normalized };
+    }
   } catch {}
 
-  graphicAvatarCache.set(url, img || null);
-  return img || null;
+  return { img: null, buf: null, url: normalized };
 }
 
-function setGraphicFont(ctx, size, weight = 'regular') {
-  const family = weight === 'bold' ? GRAPHIC_FONT_BOLD : GRAPHIC_FONT_REG;
-  ctx.font = `${Math.max(8, Math.floor(size))}px '${family}'`;
-}
+async function getFreshDiscordAvatarUrls(client, userId) {
+  const urls = [];
+  if (!client || !userId) return urls;
 
-function measureGraphicTextWidth(ctx, text, size, weight = 'regular') {
-  const value = String(text ?? '');
-  setGraphicFont(ctx, size, weight);
   try {
-    const measured = ctx.measureText(value);
-    if (measured && Number.isFinite(measured.width)) return measured.width;
-  } catch {}
-  return value.length * size * (weight === 'bold' ? 0.64 : 0.58);
-}
-
-function fitGraphicSingleLine(ctx, text, maxWidth, maxSize, minSize, weight = 'regular') {
-  const source = String(text ?? '').trim() || 'unknown';
-  let size = Math.max(minSize, maxSize);
-  while (size > minSize && measureGraphicTextWidth(ctx, source, size, weight) > maxWidth) size -= 1;
-
-  let fitted = source;
-  if (measureGraphicTextWidth(ctx, fitted, size, weight) > maxWidth) {
-    const ellipsis = '…';
-    while (fitted.length > 1 && measureGraphicTextWidth(ctx, fitted + ellipsis, size, weight) > maxWidth) {
-      fitted = fitted.slice(0, -1);
-    }
-    fitted = fitted.length < source.length ? (fitted + ellipsis) : fitted;
-  }
-
-  return { text: fitted, size };
-}
-
-function centerGraphicTextX(ctx, text, x, width, size, weight = 'regular') {
-  const measured = measureGraphicTextWidth(ctx, text, size, weight);
-  return x + Math.max(0, Math.floor((width - measured) / 2));
-}
-
-function drawGraphicTextOutline(ctx, text, x, y, options = {}) {
-  const fill = options.fill || 'rgba(255,255,255,0.98)';
-  const outline = options.outline || 'rgba(0,0,0,0.98)';
-  const radius = Math.max(1, options.radius || 2);
-  ctx.fillStyle = outline;
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dy = -radius; dy <= radius; dy++) {
-      if (dx === 0 && dy === 0) continue;
-      ctx.fillText(text, x + dx, y + dy);
-    }
-  }
-  ctx.fillStyle = fill;
-  ctx.fillText(text, x, y);
-}
-
-async function hydrateGraphicUsernames(client) {
-  let changed = 0;
-  for (const rating of Object.values(db.ratings || {})) {
-    if (!rating?.userId) continue;
-    try {
-      const user = await client.users.fetch(rating.userId);
-      if (user?.username && rating.username !== user.username) {
-        rating.username = user.username;
-        changed++;
+    const guild = await getGuild(client);
+    const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
+    if (member) {
+      const memberUrl = normalizeDiscordAvatarUrl(member.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
+      if (memberUrl) urls.push(memberUrl);
+      const user = member.user || null;
+      if (user) {
+        const userUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
+        const defaultUrl = normalizeDiscordAvatarUrl(user.defaultAvatarURL || "");
+        if (userUrl) urls.push(userUrl);
+        if (defaultUrl) urls.push(defaultUrl);
       }
-    } catch {}
+    }
+  } catch {}
+
+  try {
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (user) {
+      const userUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
+      const defaultUrl = normalizeDiscordAvatarUrl(user.defaultAvatarURL || "");
+      if (userUrl) urls.push(userUrl);
+      if (defaultUrl) urls.push(defaultUrl);
+    }
+  } catch {}
+
+  return [...new Set(urls.filter(Boolean))];
+}
+
+async function loadGraphicAvatarForPlayer(client, player) {
+  const userId = player?.userId || "";
+  const rating = db.ratings?.[userId];
+
+  if (userId && graphicAvatarCache.has(`disk:${userId}`)) {
+    return graphicAvatarCache.get(`disk:${userId}`);
   }
+
+  const diskImg = await loadGraphicAvatarFromDisk(userId);
+  if (diskImg) return diskImg;
+
+  const candidates = [];
+  const push = (url) => {
+    const normalized = normalizeDiscordAvatarUrl(url || "");
+    if (normalized) candidates.push(normalized);
+  };
+
+  push(player?.avatarUrl);
+  push(rating?.avatarUrl);
+  for (const freshUrl of await getFreshDiscordAvatarUrls(client, userId)) push(freshUrl);
+
+  for (const url of [...new Set(candidates)]) {
+    const res = await fetchGraphicAvatarFromUrl(url);
+    if (!res.img) continue;
+
+    if (userId && res.buf) {
+      saveGraphicAvatarBufferToDisk(userId, res.buf);
+      graphicAvatarCache.set(`disk:${userId}`, res.img);
+    }
+
+    if (player) player.avatarUrl = res.url;
+    if (rating && rating.avatarUrl !== res.url) {
+      rating.avatarUrl = res.url;
+      rating.updatedAt = new Date().toISOString();
+      saveDB(db);
+    }
+    return res.img;
+  }
+
+  return null;
+}
+
+async function hydrateGraphicAvatarUrls(client) {
+  if (!client) return 0;
+  let changed = 0;
+
+  for (const [userId, rating] of Object.entries(db.ratings || {})) {
+    const current = normalizeDiscordAvatarUrl(rating?.avatarUrl || "");
+    const freshList = await getFreshDiscordAvatarUrls(client, userId);
+    const best = freshList[0] || current || "";
+    if (!best) continue;
+    if (best !== rating.avatarUrl) {
+      rating.avatarUrl = best;
+      changed++;
+    }
+  }
+
   if (changed) saveDB(db);
   return changed;
 }
 
-async function renderGraphicTierlistPng() {
+async function hydrateGraphicUsernames(client) {
+  if (!client) return 0;
+  let changed = 0;
+
+  for (const [userId, rating] of Object.entries(db.ratings || {})) {
+    let nextUsername = String(rating?.username || "").trim();
+
+    try {
+      const user = await client.users.fetch(userId).catch(() => null);
+      if (user?.username) nextUsername = String(user.username).trim();
+    } catch {}
+
+    if (!nextUsername) continue;
+    if (nextUsername !== rating.username) {
+      rating.username = nextUsername;
+      changed++;
+    }
+  }
+
+  if (changed) saveDB(db);
+  return changed;
+}
+
+async function renderGraphicTierlistPng(client = null) {
   if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
-  ensureGraphicFonts();
+  if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
 
   const state = getGraphicTierlistState();
   const buckets = buildGraphicBucketsFromRatings();
@@ -607,7 +907,7 @@ async function renderGraphicTierlistPng() {
   const leftW = Math.floor(W * 0.24);
   const rightPadding = 36;
   const gap = Math.max(10, Math.floor(ICON * 0.16));
-  const overlayH = Math.max(24, Math.floor(ICON * 0.26));
+  const overlayH = Math.max(24, Math.floor(ICON * 0.24));
   const rightW = W - leftW - rightPadding - 24;
   const cols = Math.max(1, Math.floor((rightW + gap) / (ICON + gap)));
 
@@ -630,11 +930,11 @@ async function renderGraphicTierlistPng() {
   ctx.fillRect(0, 0, W, H);
 
   fillColor(ctx, '#ffffff');
-  ctx.font = `64px '${GRAPHIC_FONT_BOLD}'`;
+  setGraphicFont(ctx, 64, "bold");
   ctx.fillText(state.title || GRAPHIC_TIERLIST_TITLE, 40, 82);
 
   fillColor(ctx, '#cfcfcf');
-  ctx.font = `22px '${GRAPHIC_FONT_REG}'`;
+  setGraphicFont(ctx, 22, "regular");
   ctx.fillText(`players: ${entries.length}. updated: ${new Date().toLocaleString('ru-RU')}`, 40, H - 18);
 
   let yCursor = topY;
@@ -652,15 +952,17 @@ async function renderGraphicTierlistPng() {
     ctx.fillRect(40, y, leftW - 40, rowH - 12);
 
     const blockH = rowH - 12;
-    fillColor(ctx, '#111111');
-    const tierTitle = formatTierTitle(tierKey);
-    const tierTitleFit = fitGraphicSingleLine(ctx, tierTitle, leftW - 130, 56, 26, 'bold');
-    setGraphicFont(ctx, tierTitleFit.size, 'bold');
-    ctx.fillText(tierTitleFit.text, 40 + 70, y + Math.floor(blockH / 2) + Math.floor(tierTitleFit.size * 0.34));
+    const labelX = 40 + 56;
+    const labelW = (leftW - 40) - 56 - 18;
+    const bottomLabelY = y + blockH - 18;
+    const titleBoxY = y + 16;
+    const titleBoxH = Math.max(44, bottomLabelY - titleBoxY - 18);
+
+    drawGraphicTierTitle(ctx, formatTierTitle(tierKey), labelX, titleBoxY, labelW, titleBoxH);
 
     fillColor(ctx, '#111111');
-    setGraphicFont(ctx, 24, 'regular');
-    ctx.fillText(`TIER ${tierKey}`, 40 + 70, y + blockH - 18);
+    setGraphicFont(ctx, 24, "regular");
+    ctx.fillText(`TIER ${tierKey}`, labelX, bottomLabelY);
 
     const list = buckets[tierKey] || [];
     const rightX = leftW + 24;
@@ -673,7 +975,7 @@ async function renderGraphicTierlistPng() {
       const x = rightX + col * (ICON + gap);
       const yy = rightY + row * (ICON + gap);
 
-      const avatar = await loadGraphicAvatar(player.avatarUrl);
+      const avatar = await loadGraphicAvatarForPlayer(client, player);
 
       fillColor(ctx, '#171717');
       ctx.fillRect(x - 3, yy - 3, ICON + 6, ICON + 6);
@@ -683,24 +985,38 @@ async function renderGraphicTierlistPng() {
       } else {
         fillColor(ctx, '#555555');
         ctx.fillRect(x, yy, ICON, ICON);
+        fillColor(ctx, '#f3f3f3');
+        setGraphicFont(ctx, Math.max(18, Math.floor(ICON * 0.28)), "bold");
+        const initials = String(player.name || "?").trim().split(/\s+/).slice(0, 2).map(s => s[0] || "").join("").toUpperCase() || "?";
+        const ix = x + Math.max(10, Math.floor((ICON - (initials.length * Math.max(14, Math.floor(ICON * 0.16)))) / 2));
+        const iy = yy + Math.floor(ICON / 2) + Math.max(8, Math.floor(ICON * 0.08));
+        ctx.fillText(initials, ix, iy);
       }
 
-      const usernameText = String(player.username || player.name || player.userId || 'user').trim() || 'user';
-      const usernameFit = fitGraphicSingleLine(ctx, usernameText, ICON - 10, Math.max(14, Math.floor(ICON * 0.16)), 9, 'bold');
+      const usernameBarH = Math.max(22, Math.floor(ICON * 0.24));
       ctx.fillStyle = 'rgba(0,0,0,0.78)';
-      ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
-      ctx.fillStyle = 'rgba(255,255,255,0.96)';
-      setGraphicFont(ctx, usernameFit.size, 'bold');
-      const usernameX = centerGraphicTextX(ctx, usernameFit.text, x, ICON, usernameFit.size, 'bold');
-      const usernameY = yy + ICON - Math.max(6, Math.floor((overlayH - usernameFit.size) / 2) - 1);
-      ctx.fillText(usernameFit.text, usernameX, usernameY);
+      ctx.fillRect(x, yy + ICON - usernameBarH, ICON, usernameBarH);
+
+      const usernameFit = fitGraphicSingleLineText(
+        ctx,
+        String(player.username || player.name || player.userId || "").trim(),
+        "bold",
+        Math.max(10, ICON - 10),
+        Math.max(11, Math.floor(ICON * 0.18)),
+        10
+      );
+      setGraphicFont(ctx, usernameFit.px, "bold");
+      ctx.fillStyle = 'rgba(255,255,255,0.98)';
+      const usernameY = yy + ICON - Math.max(6, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
+      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, ICON), usernameY);
 
       const eloText = String(player.elo || 0);
-      const eloFit = fitGraphicSingleLine(ctx, eloText, Math.floor(ICON * 0.48), Math.max(20, Math.floor(ICON * 0.22)), 12, 'bold');
-      const eloX = x + ICON - 8 - measureGraphicTextWidth(ctx, eloFit.text, eloFit.size, 'bold');
-      const eloY = yy + 10 + eloFit.size;
-      setGraphicFont(ctx, eloFit.size, 'bold');
-      drawGraphicTextOutline(ctx, eloFit.text, eloX, eloY, { fill: 'rgba(255,255,255,0.98)', outline: 'rgba(0,0,0,0.98)', radius: 2 });
+      const eloPx = Math.max(18, Math.floor(ICON * 0.22));
+      setGraphicFont(ctx, eloPx, "bold");
+      const eloW = measureGraphicTextWidth(ctx, eloText);
+      const eloX = x + ICON - eloW - 8;
+      const eloY = yy + eloPx + 8;
+      drawGraphicOutlinedText(ctx, eloText, eloX, eloY, "#ffffff", "#000000");
     }
   }
 
@@ -732,12 +1048,13 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
     try { msg = await channel.messages.fetch(state.dashboardMessageId); } catch {}
   }
 
+  await hydrateGraphicAvatarUrls(client).catch(() => 0);
   await hydrateGraphicUsernames(client).catch(() => 0);
-  const png = await renderGraphicTierlistPng();
+  const png = await renderGraphicTierlistPng(client);
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
     .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
-    .setDescription('Отдельный графический тир-лист ELO. Основной embed-индекс остаётся без изменений.')
+    .setDescription(getGraphicDashboardEmbedDescription())
     .setImage('attachment://elo-tierlist.png');
 
   if (!msg) {
@@ -774,12 +1091,13 @@ async function refreshGraphicTierlist(client) {
     return true;
   }
 
+  await hydrateGraphicAvatarUrls(client).catch(() => 0);
   await hydrateGraphicUsernames(client).catch(() => 0);
-  const png = await renderGraphicTierlistPng();
+  const png = await renderGraphicTierlistPng(client);
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
     .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
-    .setDescription('Отдельный графический тир-лист ELO. Основной embed-индекс остаётся без изменений.')
+    .setDescription(getGraphicDashboardEmbedDescription())
     .setImage('attachment://elo-tierlist.png');
 
   await msg.edit({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents(), attachments: [] });
@@ -788,6 +1106,37 @@ async function refreshGraphicTierlist(client) {
   return true;
 }
 
+
+async function bumpGraphicTierlist(client) {
+  const state = getGraphicTierlistState();
+  const channelId = state.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID;
+  if (!channelId) return false;
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased()) return false;
+
+  await hydrateGraphicUsernames(client).catch(() => 0);
+  const png = await renderGraphicTierlistPng();
+  const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
+  const embed = new EmbedBuilder()
+    .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
+    .setDescription(getGraphicDashboardEmbedDescription())
+    .setImage('attachment://elo-tierlist.png');
+
+  const oldMessageId = state.dashboardMessageId || "";
+  const msg = await channel.send({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents() });
+
+  state.dashboardChannelId = channel.id;
+  state.dashboardMessageId = msg.id;
+  state.lastUpdated = Date.now();
+  saveDB(db);
+
+  if (oldMessageId && oldMessageId !== msg.id) {
+    const oldMsg = await channel.messages.fetch(oldMessageId).catch(() => null);
+    if (oldMsg) await oldMsg.delete().catch(() => {});
+  }
+  return true;
+}
 function buildGraphicPanelTierSelect() {
   const graphic = getGraphicTierlistState();
   const selected = Number(graphic.panel?.selectedTier) || 5;
@@ -819,13 +1168,15 @@ function buildGraphicPanelPayload() {
       `**Иконки:** ${cfg.ICON}px`,
       `**Выбранный тир:** ${selectedTier} → **${tierLabel}**`,
       `**Цвет тира:** ${tierColor}`,
+      `**Текст сообщения:** ${previewGraphicMessageText(170)}`,
       '',
-      'Панель меняет только PNG-контур и связанные подписи и цвета. Основной embed-индекс продолжает жить отдельно.'
+      'Панель меняет только PNG-контур и связанные подписи и цвета. Текстовый tierlist-канал отключён и больше не используется.'
     ].join('\n'));
 
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('graphic_panel_refresh').setLabel('Пересобрать').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('graphic_panel_title').setLabel('Название PNG').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('graphic_panel_message_text').setLabel('Текст сообщения').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('graphic_panel_rename').setLabel('Переименовать тир').setStyle(ButtonStyle.Primary)
   );
 
@@ -883,14 +1234,15 @@ async function fetchReviewMessage(client, sub) {
   return msg;
 }
 
-
-async function supersedePendingSubmissionsForUser(client, userId, moderatorTag = "system") {
-  const pending = Object.values(db.submissions || {}).filter((s) => s.userId === userId && s.status === "pending");
-  for (const sub of pending) {
+async function supersedePendingSubmissionsForUser(client, userId, moderatorTag) {
+  let changed = 0;
+  for (const sub of Object.values(db.submissions || {})) {
+    if (!sub || sub.userId !== userId || sub.status !== "pending") continue;
     sub.status = "superseded";
     sub.reviewedBy = moderatorTag;
     sub.reviewedAt = new Date().toISOString();
-    sub.rejectReason = "Обновлено модератором вручную";
+    sub.rejectReason = "Добавлено/обновлено модератором напрямую";
+    changed++;
     const msg = await fetchReviewMessage(client, sub);
     if (msg) {
       await msg.edit({
@@ -899,11 +1251,12 @@ async function supersedePendingSubmissionsForUser(client, userId, moderatorTag =
       }).catch(() => {});
     }
   }
-  saveDB(db);
+  if (changed) saveDB(db);
+  return changed;
 }
 
 async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawText, moderatorTag) {
-  if (!targetUser) throw new Error("Не выбран игрок.");
+  if (!targetUser) throw new Error("target user is required");
   if (!screenshotAttachment || !isImageAttachment(screenshotAttachment)) {
     throw new Error("Нужен скрин-картинка.");
   }
@@ -935,17 +1288,15 @@ async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawT
   db.ratings[targetUser.id] = rating;
   saveDB(db);
 
-  await upsertCardMessage(client, rating, moderatorTag);
-  await updateIndex(client);
+  await loadGraphicAvatarForPlayer(client, rating).catch(() => null);
   await refreshGraphicTierlist(client).catch(() => false);
   await ensureSingleTierRole(client, targetUser.id, tier, "Manual tier set by moderator");
-  await deleteMiniCardMessage(client, targetUser.id).catch(() => false);
   await supersedePendingSubmissionsForUser(client, targetUser.id, moderatorTag);
+  await createManualApprovedReviewRecord(client, targetUser, screenshotAttachment, elo, tier, moderatorTag).catch(() => null);
   saveDB(db);
 
   return rating;
 }
-
 
 
 // ====== MINI CARDS (SUBMIT CHANNEL) ======
@@ -995,75 +1346,89 @@ async function syncMiniCards(client) {
   return { created: 0, removed, total: Object.keys(db.ratings || {}).length };
 }
 
-// ====== TIERLIST INDEX ======
-async function ensureIndexMessage(client) {
-  const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) throw new Error("TIERLIST_CHANNEL_ID: не текстовый канал");
+
+async function postReviewRecord(client, sub, fileAttachment = null, statusLabel = null, extraFields = [], components = []) {
+  const reviewChannel = await client.channels.fetch(REVIEW_CHANNEL_ID).catch(() => null);
+  if (!reviewChannel || !reviewChannel.isTextBased()) return null;
+
+  const payload = {
+    embeds: [buildReviewEmbed(sub, statusLabel || sub.status || "pending", extraFields)],
+    components,
+  };
+  if (fileAttachment) payload.files = [fileAttachment];
+
+  const sent = await reviewChannel.send(payload);
+  sub.reviewChannelId = sent.channel.id;
+  sub.reviewMessageId = sent.id;
+  return sent;
+}
+
+async function createManualApprovedReviewRecord(client, targetUser, screenshotAttachment, elo, tier, moderatorTag) {
+  const submissionId = makeId();
+  const guild = await getGuild(client).catch(() => null);
+  const member = guild ? await guild.members.fetch(targetUser.id).catch(() => null) : null;
+
+  let reviewFile = null;
+  let reviewImage = screenshotAttachment.url;
+  let reviewFileName = null;
+  try {
+    const buf = await downloadToBuffer(screenshotAttachment.url);
+    reviewFileName = sanitizeFileName(`${submissionId}_${screenshotAttachment.name || "screenshot"}`);
+    reviewFile = new AttachmentBuilder(buf, { name: reviewFileName });
+    reviewImage = `attachment://${reviewFileName}`;
+  } catch {}
+
+  const sub = {
+    id: submissionId,
+    userId: targetUser.id,
+    name: member?.displayName || targetUser.username,
+    elo,
+    tier,
+    screenshotUrl: screenshotAttachment.url,
+    reviewImage,
+    reviewFileName,
+    messageUrl: screenshotAttachment.url,
+    status: "approved",
+    createdAt: new Date().toISOString(),
+    reviewedBy: moderatorTag,
+    reviewedAt: new Date().toISOString(),
+    reviewChannelId: null,
+    reviewMessageId: null,
+    manual: true,
+  };
+
+  db.submissions[submissionId] = sub;
+  saveDB(db);
+  await postReviewRecord(
+    client,
+    sub,
+    reviewFile,
+    "approved",
+    [{ name: "Источник", value: `Ручное добавление модератором: ${moderatorTag}`, inline: false }],
+    []
+  );
+  saveDB(db);
+  return sub;
+}
+
+// ====== LEGACY TEXT TIERLIST CLEANUP ======
+function cleanupLegacyTextTierlistState() {
+  let clearedCards = 0;
+  let clearedIndexLink = false;
 
   if (db.config.indexMessageId) {
-    try {
-      const msg = await channel.messages.fetch(db.config.indexMessageId);
-      if (msg) return msg;
-    } catch {}
+    db.config.indexMessageId = "";
+    clearedIndexLink = true;
   }
 
-  const embed = new EmbedBuilder()
-    .setTitle("ТИР-СПИСОК (авто)")
-    .setDescription("Пока пусто.");
-
-  const msg = await channel.send({ embeds: [embed] });
-  try { await msg.pin(); } catch {}
-  db.config.indexMessageId = msg.id;
-  saveDB(db);
-  return msg;
-}
-
-function buildIndexEmbed() {
-  const entries = Object.values(db.ratings);
-  const tiers = { 1: [], 2: [], 3: [], 4: [], 5: [] };
-
-  for (const r of entries) {
-    const t = Number(r.tier);
-    if (tiers[t]) tiers[t].push(r);
+  for (const rating of Object.values(db.ratings || {})) {
+    if (!rating || !Object.prototype.hasOwnProperty.call(rating, "cardMessageId")) continue;
+    delete rating.cardMessageId;
+    clearedCards++;
   }
 
-  for (const t of Object.keys(tiers)) {
-    tiers[t].sort((a, b) => (b.elo || 0) - (a.elo || 0));
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("ТИР-СПИСОК (авто)")
-    .setFooter({ text: "Подача: #elo-submit • Проверка: #elo-review" });
-
-  for (const t of [5, 4, 3, 2, 1]) {
-    const list = tiers[t];
-    if (!list.length) {
-      embed.addFields({ name: formatTierTitle(t), value: "—", inline: false });
-      continue;
-    }
-    const lines = list.slice(0, 50).map((r, i) => `${i + 1}. <@${r.userId}> (${r.name}) — **${r.elo}**`);
-    embed.addFields({ name: formatTierTitle(t), value: lines.join("\n"), inline: false });
-  }
-
-  return embed;
-}
-
-async function updateIndex(client) {
-  const indexMsg = await ensureIndexMessage(client);
-  await indexMsg.edit({ embeds: [buildIndexEmbed()] });
-}
-
-async function deleteRatingCardMessage(client, rating) {
-  if (!rating?.cardMessageId) return false;
-  const ch = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
-  if (!ch?.isTextBased()) {
-    rating.cardMessageId = "";
-    return false;
-  }
-  const msg = await ch.messages.fetch(rating.cardMessageId).catch(() => null);
-  if (msg) await msg.delete().catch(() => {});
-  rating.cardMessageId = "";
-  return !!msg;
+  if (clearedIndexLink || clearedCards) saveDB(db);
+  return { clearedCards, clearedIndexLink };
 }
 
 async function rebuildEloTierlist(client) {
@@ -1072,9 +1437,8 @@ async function rebuildEloTierlist(client) {
   let retiered = 0;
   let hidden = 0;
   let rolesSynced = 0;
-  let cardsUpdated = 0;
-  let cardsDeleted = 0;
-  let miniTouched = 0;
+
+  const cleanup = cleanupLegacyTextTierlistState();
 
   for (const uid of ids) {
     const rating = db.ratings[uid];
@@ -1091,61 +1455,20 @@ async function rebuildEloTierlist(client) {
 
     if (!nextTier) {
       hidden++;
-      if (await deleteRatingCardMessage(client, rating)) cardsDeleted++;
       await clearAllTierRoles(client, uid, "Rebuild invalid rating");
       rolesSynced++;
-      const miniDeleted = await deleteMiniCardMessage(client, uid).catch(() => false);
-      if (miniDeleted) miniTouched++;
       continue;
     }
 
-    await upsertCardMessage(client, rating, "rebuild");
-    cardsUpdated++;
     await ensureSingleTierRole(client, uid, nextTier, "Rebuild retier");
     rolesSynced++;
-    const miniRes = await upsertMiniCardMessage(client, rating).catch(() => ({ changed: false }));
-    if (miniRes?.changed) miniTouched++;
   }
 
   saveDB(db);
-  await updateIndex(client);
   const pngUpdated = await refreshGraphicTierlist(client).catch(() => false);
   saveDB(db);
 
-  return { total, retiered, hidden, rolesSynced, cardsUpdated, cardsDeleted, miniTouched, pngUpdated };
-}
-
-async function upsertCardMessage(client, rating, approvedByTag) {
-  const channel = await client.channels.fetch(TIERLIST_CHANNEL_ID);
-  if (!channel || !channel.isTextBased()) return;
-
-  const embed = new EmbedBuilder()
-    .setAuthor({
-      name: `${rating.name} • ${formatTierTitle(rating.tier)}`,
-      iconURL: rating.avatarUrl || undefined,
-    })
-    .setTitle(`ELO: ${rating.elo}`)
-    .addFields(
-      { name: "Тир", value: `**${rating.tier}**`, inline: true },
-      { name: "ELO", value: `**${rating.elo}**`, inline: true },
-      { name: "Пруф", value: rating.proofUrl ? `[скрин](${rating.proofUrl})` : "—", inline: true }
-    )
-    .setFooter({ text: `Approved by ${approvedByTag}` });
-
-  if (rating.proofUrl) embed.setImage(rating.proofUrl);
-
-  if (rating.cardMessageId) {
-    try {
-      const msg = await channel.messages.fetch(rating.cardMessageId);
-      await msg.edit({ embeds: [embed] });
-      return;
-    } catch {
-      rating.cardMessageId = "";
-    }
-  }
-
-  const msg = await channel.send({ embeds: [embed] });
-  rating.cardMessageId = msg.id;
+  return { total, retiered, hidden, rolesSynced, pngUpdated, cleanup };
 }
 
 // ====== REVIEW UI ======
@@ -1184,16 +1507,21 @@ function buildCommands() {
       .addSubcommand(s => s.setName("user").setDescription("Показать рейтинг игрока")
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
       .addSubcommand(s => s.setName("pending").setDescription("Показать pending заявки (модеры)"))
-      .addSubcommand(s => s.setName("rebuild").setDescription("Пересобрать закреп (модеры)"))
+      .addSubcommand(s => s.setName("rebuild").setDescription("Пересчитать тиры, роли и PNG тир-лист (модеры)"))
       .addSubcommand(s => s.setName("graphicsetup").setDescription("Создать/пересоздать PNG тир-лист в отдельном канале (модеры)")
         .addChannelOption(o => o.setName("channel").setDescription("Канал для PNG тир-листа").setRequired(true)))
       .addSubcommand(s => s.setName("graphicrebuild").setDescription("Пересобрать PNG тир-лист (модеры)"))
+      .addSubcommand(s => s.setName("graphicbump").setDescription("Отправить PNG тир-лист заново вниз канала и удалить старое сообщение (модеры)"))
       .addSubcommand(s => s.setName("graphicstatus").setDescription("Статус PNG тир-листа (модеры)"))
       .addSubcommand(s => s.setName("graphicpanel").setDescription("Панель PNG тир-листа (модеры)"))
       .addSubcommand(s => s.setName("remove").setDescription("Удалить игрока из тир-листа (модеры)")
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
+      .addSubcommand(s => s.setName("modset").setDescription("Добавить или обновить игрока напрямую (модеры)")
+        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true))
+        .addAttachmentOption(o => o.setName("screenshot").setDescription("Скрин-пруф").setRequired(true))
+        .addStringOption(o => o.setName("text").setDescription("Текст после юзернейма, из него берётся ELO").setRequired(true)))
       .addSubcommand(s => s.setName("wipe").setDescription("Очистить рейтинг полностью (модеры)")
-        .addStringOption(o => o.setName("mode").setDescription("soft=только база, hard=база+удалить карточки").setRequired(true)
+        .addStringOption(o => o.setName("mode").setDescription("Режим очистки. После stage 2 оба режима чистят рейтинг без review-карточек").setRequired(true)
           .addChoices(
             { name: "soft", value: "soft" },
             { name: "hard", value: "hard" }
@@ -1205,10 +1533,6 @@ function buildCommands() {
         .addStringOption(o => o.setName("t3").setDescription("Название тира 3").setRequired(true))
         .addStringOption(o => o.setName("t4").setDescription("Название тира 4").setRequired(true))
         .addStringOption(o => o.setName("t5").setDescription("Название тира 5").setRequired(true)))
-      .addSubcommand(s => s.setName("modset").setDescription("Добавить или обновить игрока вручную (модеры)")
-        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true))
-        .addAttachmentOption(o => o.setName("screenshot").setDescription("Скриншот-пруф").setRequired(true))
-        .addStringOption(o => o.setName("text").setDescription("Текст с числом ELO. пример: 87 elo").setRequired(true)))
   ].map(c => c.toJSON());
 }
 
@@ -1234,8 +1558,7 @@ client.once("ready", async () => {
   // рег слэш-команд (guild, применяются быстро)
   await registerGuildCommands(client);
 
-  await ensureIndexMessage(client);
-  await updateIndex(client);
+  cleanupLegacyTextTierlistState();
   await syncTierRolesOnStart(client);
   await syncMiniCards(client);
   try {
@@ -1336,20 +1659,9 @@ client.on("messageCreate", async (message) => {
   db.cooldowns[message.author.id] = Date.now();
   saveDB(db);
 
-  const reviewChannel = await client.channels.fetch(REVIEW_CHANNEL_ID).catch(() => null);
-  if (!reviewChannel || !reviewChannel.isTextBased()) return;
-
   const sub = db.submissions[submissionId];
-  const payload = {
-    embeds: [buildReviewEmbed(sub, "pending")],
-    components: [buildReviewButtons(submissionId)],
-  };
-  if (reviewFile) payload.files = [reviewFile];
-  const sent = await reviewChannel.send(payload);
-
-  // сохраняем, чтобы модалки могли редактировать сообщение
-  sub.reviewChannelId = sent.channel.id;
-  sub.reviewMessageId = sent.id;
+  const sent = await postReviewRecord(client, sub, reviewFile, "pending", [], [buildReviewButtons(submissionId)]);
+  if (!sent) return;
   saveDB(db);
 
   const ok = await message.reply("Заявка отправлена на проверку модерам.");
@@ -1433,9 +1745,9 @@ client.on("interactionCreate", async (interaction) => {
         `Сменили тир: ${res.retiered}`,
         `Скрыто как невалидные: ${res.hidden}`,
         `Роли синкнуты: ${res.rolesSynced}`,
-        `Карточки обновлены: ${res.cardsUpdated}`,
-        `Карточки удалены: ${res.cardsDeleted}`,
-        `Мини-карточки затронуты: ${res.miniTouched}`,
+        `Review-карточки не тронуты: да`,
+        `Очищено legacy card links: ${res.cleanup?.clearedCards || 0}`,
+        `Сброшен legacy index link: ${res.cleanup?.clearedIndexLink ? "да" : "нет"}`,
         `PNG: ${res.pngUpdated ? "обновлён" : "не настроен или пропущен"}`
       ];
       await interaction.editReply({ content: lines.join("\n") });
@@ -1455,8 +1767,17 @@ client.on("interactionCreate", async (interaction) => {
 
     // /elo graphicrebuild
     if (sub === "graphicrebuild") {
+      await interaction.deferReply({ ephemeral: true });
       const ok = await refreshGraphicTierlist(client);
-      await interaction.reply({ content: ok ? "PNG тир-лист обновлён." : "PNG тир-лист ещё не настроен. Сначала /elo graphicsetup.", ephemeral: true });
+      await interaction.editReply({ content: ok ? "PNG тир-лист обновлён." : "PNG тир-лист ещё не настроен. Сначала /elo graphicsetup." });
+      return;
+    }
+
+    // /elo graphicbump
+    if (sub === "graphicbump") {
+      await interaction.deferReply({ ephemeral: true });
+      const ok = await bumpGraphicTierlist(client);
+      await interaction.editReply({ content: ok ? "PNG тир-лист отправлен заново вниз канала. Старое сообщение удалено." : "PNG тир-лист ещё не настроен. Сначала /elo graphicsetup." });
       return;
     }
 
@@ -1466,6 +1787,7 @@ client.on("interactionCreate", async (interaction) => {
       const cfg = getGraphicImageConfig();
       const lines = [
         `title: ${graphic.title || GRAPHIC_TIERLIST_TITLE}`,
+        `messageText: ${previewGraphicMessageText(120)}`,
         `channelId: ${graphic.dashboardChannelId || "—"}`,
         `messageId: ${graphic.dashboardMessageId || "—"}`,
         `img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON}`,
@@ -1473,7 +1795,9 @@ client.on("interactionCreate", async (interaction) => {
         `tierColors: ${GRAPHIC_TIER_ORDER.map(t => `${t}=${graphic.tierColors?.[t] || DEFAULT_GRAPHIC_TIER_COLORS[t]}`).join(', ')}`,
         `lastUpdated: ${graphic.lastUpdated ? new Date(graphic.lastUpdated).toLocaleString("ru-RU") : "—"}`,
         `font regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(none)"}`,
-        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`
+        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`,
+        `font source: ${GRAPHIC_FONT_INFO.source || "(none)"}`,
+        `font error: ${GRAPHIC_FONT_INFO.loadError || "(none)"}`
       ];
       await interaction.reply({ content: lines.join("\n"), ephemeral: true });
       return;
@@ -1485,33 +1809,28 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    // /elo modset
+    if (sub === "modset") {
+      const target = interaction.options.getUser("target", true);
+      const screenshot = interaction.options.getAttachment("screenshot", true);
+      const rawText = interaction.options.getString("text", true);
 
-// /elo modset
-if (sub === "modset") {
-  const target = interaction.options.getUser("target", true);
-  const screenshot = interaction.options.getAttachment("screenshot", true);
-  const rawText = interaction.options.getString("text", true);
-
-  await interaction.deferReply({ ephemeral: true });
-  try {
-    const rating = await upsertRatingDirect(client, target, screenshot, rawText, interaction.user.tag);
-    await interaction.editReply({
-      content:
-        `Ок. Обновил <@${rating.userId}>
-` +
-        `username: **${rating.username || target.username}**
-` +
-        `ELO: **${rating.elo}**
-` +
-        `Тир: **${rating.tier}** (${formatTierTitle(rating.tier)})`
-    });
-  } catch (e) {
-    await interaction.editReply({ content: `Ошибка: ${e?.message || e}` });
-  }
-  return;
-}
-
-
+      try {
+        const rating = await upsertRatingDirect(client, target, screenshot, rawText, interaction.user.tag);
+        await interaction.reply({
+          content: `Ок. <@${target.id}> теперь в тир-листе. ELO **${rating.elo}**, тир **${rating.tier}**.`,
+          ephemeral: true,
+        });
+        await dmUser(client, target.id, `Модератор обновил твой рейтинг.
+ELO: ${rating.elo}
+Тир: ${rating.tier}
+Пруф: ${rating.proofUrl}`);
+        await logLine(client, `MODSET: <@${target.id}> ELO ${rating.elo} -> Tier ${rating.tier} by ${interaction.user.tag}`);
+      } catch (err) {
+        await interaction.reply({ content: String(err?.message || err || "Не удалось добавить игрока."), ephemeral: true });
+      }
+      return;
+    }
 
     // /elo labels
     if (sub === "labels") {
@@ -1523,7 +1842,6 @@ if (sub === "modset") {
         5: interaction.options.getString("t5", true),
       };
       saveDB(db);
-      await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await interaction.reply({ content: "Названия тиров обновлены. PNG тоже обновлён, если был настроен.", ephemeral: true });
       return;
@@ -1539,18 +1857,9 @@ if (sub === "modset") {
         return;
       }
 
-      if (rating.cardMessageId) {
-        const ch = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
-        if (ch?.isTextBased()) {
-          const msg = await ch.messages.fetch(rating.cardMessageId).catch(() => null);
-          if (msg) await msg.delete().catch(() => {});
-        }
-      }
-
       delete db.ratings[target.id];
       saveDB(db);
       await deleteMiniCardMessage(client, target.id);
-      await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await clearAllTierRoles(client, target.id, "Removed from tierlist");
 
@@ -1568,23 +1877,11 @@ if (sub === "modset") {
         return;
       }
 
-      if (mode === "hard") {
-        const ch = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
-        if (ch?.isTextBased()) {
-          for (const r of Object.values(db.ratings)) {
-            if (!r.cardMessageId) continue;
-            const msg = await ch.messages.fetch(r.cardMessageId).catch(() => null);
-            if (msg) await msg.delete().catch(() => {});
-          }
-        }
-      }
-
       const _wipeIds = Object.keys(db.ratings || {});
       for (const uid of _wipeIds) {
         await clearAllTierRoles(client, uid, "Wipe ratings");
       }
 
-      // мини-карточки в submit должны пропасть, раз тир-лист очищен
       const _miniIds = Object.keys(db.miniCards || {});
       for (const uid of _miniIds) {
         await deleteMiniCardMessage(client, uid);
@@ -1593,7 +1890,6 @@ if (sub === "modset") {
 
       db.ratings = {};
       saveDB(db);
-      await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
 
       await logLine(client, `WIPE_RATINGS (${mode}) by ${interaction.user.tag}`);
@@ -1640,13 +1936,15 @@ if (sub === "modset") {
       }
 
       if (interaction.customId === "graphic_panel_fonts") {
-        ensureGraphicFonts();
+        if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
         const files = listGraphicFontFiles();
         const lines = [
           `ttf: ${files.length ? files.map(f => path.basename(f)).join(", ") : "(none)"}`,
           `picked regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(null)"}`,
           `picked bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(null)"}`,
-          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`
+          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`,
+          `source: ${GRAPHIC_FONT_INFO.source || "(none)"}`,
+          `error: ${GRAPHIC_FONT_INFO.loadError || "(none)"}`
         ];
         await interaction.reply({ content: lines.join("\n"), ephemeral: true });
         return;
@@ -1665,6 +1963,24 @@ if (sub === "modset") {
           .setRequired(true)
           .setMaxLength(80)
           .setValue(String(graphic.title || GRAPHIC_TIERLIST_TITLE).slice(0, 80));
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_message_text") {
+        const modal = new ModalBuilder()
+          .setCustomId("graphic_panel_message_text_modal")
+          .setTitle("Текст сообщения PNG тир-листа");
+
+        const input = new TextInputBuilder()
+          .setCustomId("graphic_message_text")
+          .setLabel("Текст под заголовком сообщения")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(4000)
+          .setValue(getGraphicMessageTextModalValue());
 
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         await interaction.showModal(modal);
@@ -1832,6 +2148,8 @@ if (sub === "modset") {
       sub.reviewedAt = new Date().toISOString();
 
       const user = await client.users.fetch(sub.userId);
+      const guild = await getGuild(client).catch(() => null);
+      const member = guild ? await guild.members.fetch(sub.userId).catch(() => null) : null;
       const rating = db.ratings[sub.userId] || { userId: sub.userId };
 
       rating.userId = sub.userId;
@@ -1840,18 +2158,16 @@ if (sub === "modset") {
       rating.elo = sub.elo;
       rating.tier = tier;
       rating.proofUrl = sub.screenshotUrl;
-      rating.avatarUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
+      rating.avatarUrl = normalizeDiscordAvatarUrl((member?.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 })) || user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }) || user.defaultAvatarURL || "");
       rating.updatedAt = new Date().toISOString();
 
       db.ratings[sub.userId] = rating;
       saveDB(db);
+      await loadGraphicAvatarForPlayer(client, rating).catch(() => null);
 
-      await upsertCardMessage(client, rating, interaction.user.tag);
       saveDB(db);
-      await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
-      await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён. PNG тоже обновлён, если был настроен.", ephemeral: true });
@@ -1927,6 +2243,21 @@ if (sub === "modset") {
       return;
     }
 
+    if (interaction.customId === "graphic_panel_message_text_modal") {
+      const graphic = getGraphicTierlistState();
+      const text = (interaction.fields.getTextInputValue("graphic_message_text") || "").trim();
+      if (!text) {
+        await interaction.reply({ content: "Пустой текст.", ephemeral: true });
+        return;
+      }
+      graphic.messageText = text.slice(0, 4000);
+      saveDB(db);
+      await interaction.deferReply({ ephemeral: true });
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply("Ок. Текст сообщения PNG обновлён.");
+      return;
+    }
+
     if (interaction.customId.startsWith("graphic_panel_rename_modal:")) {
       const tierKey = Number(interaction.customId.split(":")[1] || 5) || 5;
       const name = (interaction.fields.getTextInputValue("tier_name") || "").trim().slice(0, 32);
@@ -1938,7 +2269,6 @@ if (sub === "modset") {
       db.config.tierLabels[tierKey] = name;
       saveDB(db);
       await interaction.deferReply({ ephemeral: true });
-      await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await interaction.editReply(`Ок. Теперь **${tierKey}** называется: **${name}**.`);
       return;
