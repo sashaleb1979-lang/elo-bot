@@ -461,6 +461,7 @@ function buildGraphicBucketsFromRatings() {
     buckets[tier].push({
       userId: raw.userId,
       name: raw.name || raw.userId,
+      username: String(raw.username || "").trim() || raw.name || raw.userId,
       elo: Number(raw.elo) || 0,
       tier,
       avatarUrl: normalizeDiscordAvatarUrl(raw.avatarUrl || "")
@@ -657,6 +658,40 @@ function fitGraphicWrappedText(ctx, text, kind, maxWidth, maxHeight, startPx, mi
   return { px: minPx, lines, lineH, totalH: lines.length * lineH };
 }
 
+function trimGraphicTextToWidth(ctx, text, maxWidth) {
+  let out = String(text || "").trim();
+  if (!out) return "";
+  if (measureGraphicTextWidth(ctx, out) <= maxWidth) return out;
+  while (out.length > 1 && measureGraphicTextWidth(ctx, `${out}…`) > maxWidth) {
+    out = out.slice(0, -1).trimEnd();
+  }
+  return out.length ? `${out}…` : "";
+}
+
+function fitGraphicSingleLineText(ctx, text, kind, maxWidth, startPx, minPx = 10) {
+  const source = String(text || "").trim();
+  if (!source) return { px: minPx, text: "" };
+
+  for (let px = startPx; px >= minPx; px -= 1) {
+    setGraphicFont(ctx, px, kind);
+    if (measureGraphicTextWidth(ctx, source) <= maxWidth) return { px, text: source };
+  }
+
+  setGraphicFont(ctx, minPx, kind);
+  return { px: minPx, text: trimGraphicTextToWidth(ctx, source, maxWidth) };
+}
+
+function drawGraphicOutlinedText(ctx, text, x, y, fill = "#ffffff", outline = "#000000") {
+  const offsets = [
+    [-2, 0], [2, 0], [0, -2], [0, 2],
+    [-1, -1], [1, -1], [-1, 1], [1, 1]
+  ];
+  ctx.fillStyle = outline;
+  for (const [dx, dy] of offsets) ctx.fillText(text, x + dx, y + dy);
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+}
+
 function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
   const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
   fillColor(ctx, '#111111');
@@ -809,6 +844,29 @@ async function hydrateGraphicAvatarUrls(client) {
   return changed;
 }
 
+async function hydrateGraphicUsernames(client) {
+  if (!client) return 0;
+  let changed = 0;
+
+  for (const [userId, rating] of Object.entries(db.ratings || {})) {
+    let nextUsername = String(rating?.username || "").trim();
+
+    try {
+      const user = await client.users.fetch(userId).catch(() => null);
+      if (user?.username) nextUsername = String(user.username).trim();
+    } catch {}
+
+    if (!nextUsername) continue;
+    if (nextUsername !== rating.username) {
+      rating.username = nextUsername;
+      changed++;
+    }
+  }
+
+  if (changed) saveDB(db);
+  return changed;
+}
+
 async function renderGraphicTierlistPng(client = null) {
   if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
   if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
@@ -908,13 +966,30 @@ async function renderGraphicTierlistPng(client = null) {
         ctx.fillText(initials, ix, iy);
       }
 
-      ctx.fillStyle = 'rgba(0,0,0,0.72)';
-      ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
-      ctx.fillStyle = 'rgba(255,255,255,0.96)';
-      setGraphicFont(ctx, 24, "bold");
+      const usernameBarH = Math.max(22, Math.floor(ICON * 0.24));
+      ctx.fillStyle = 'rgba(0,0,0,0.78)';
+      ctx.fillRect(x, yy + ICON - usernameBarH, ICON, usernameBarH);
+
+      const usernameFit = fitGraphicSingleLineText(
+        ctx,
+        String(player.username || player.name || player.userId || "").trim(),
+        "bold",
+        Math.max(10, ICON - 10),
+        Math.max(11, Math.floor(ICON * 0.18)),
+        10
+      );
+      setGraphicFont(ctx, usernameFit.px, "bold");
+      ctx.fillStyle = 'rgba(255,255,255,0.98)';
+      const usernameY = yy + ICON - Math.max(6, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
+      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, ICON), usernameY);
+
       const eloText = String(player.elo || 0);
-      const tx = centerGraphicTextX(ctx, eloText, x, ICON);
-      ctx.fillText(eloText, tx, yy + ICON - 8);
+      const eloPx = Math.max(18, Math.floor(ICON * 0.22));
+      setGraphicFont(ctx, eloPx, "bold");
+      const eloW = measureGraphicTextWidth(ctx, eloText);
+      const eloX = x + ICON - eloW - 8;
+      const eloY = yy + eloPx + 8;
+      drawGraphicOutlinedText(ctx, eloText, eloX, eloY, "#ffffff", "#000000");
     }
   }
 
@@ -947,6 +1022,7 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
   }
 
   await hydrateGraphicAvatarUrls(client).catch(() => 0);
+  await hydrateGraphicUsernames(client).catch(() => 0);
   const png = await renderGraphicTierlistPng(client);
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -989,6 +1065,7 @@ async function refreshGraphicTierlist(client) {
   }
 
   await hydrateGraphicAvatarUrls(client).catch(() => 0);
+  await hydrateGraphicUsernames(client).catch(() => 0);
   const png = await renderGraphicTierlistPng(client);
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -1940,6 +2017,7 @@ client.on("interactionCreate", async (interaction) => {
 
       rating.userId = sub.userId;
       rating.name = sub.name;
+      rating.username = user.username;
       rating.elo = sub.elo;
       rating.tier = tier;
       rating.proofUrl = sub.screenshotUrl;
