@@ -283,7 +283,7 @@ const DEFAULT_GRAPHIC_TIER_COLORS = {
 let graphicFontsReady = false;
 let GRAPHIC_FONT_REG = "GraphicFontRegular";
 let GRAPHIC_FONT_BOLD = "GraphicFontBold";
-let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false };
+let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false, source: "none", loadError: null };
 const graphicAvatarCache = new Map();
 
 function getGraphicTierlistState() {
@@ -440,31 +440,34 @@ function listGraphicFontFiles() {
 function pickGraphicFontFiles() {
   const preferredPairs = [
     [
-      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
-      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf")
-    ],
-    [
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+      "system-dejavu"
     ],
     [
       "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+      "system-liberation"
     ],
+    [
+      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
+      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf"),
+      "repo-assets"
+    ]
   ];
 
-  for (const [regularFile, boldFile] of preferredPairs) {
+  for (const [regularFile, boldFile, source] of preferredPairs) {
     if (fs.existsSync(regularFile) && fs.existsSync(boldFile)) {
-      return { regularFile, boldFile, usedFallback: false };
+      return { regularFile, boldFile, usedFallback: false, source, loadError: null };
     }
   }
 
   const any = listGraphicFontFiles();
   if (any.length) {
-    return { regularFile: any[0], boldFile: any[0], usedFallback: true };
+    return { regularFile: any[0], boldFile: any[0], usedFallback: true, source: "any-ttf", loadError: null };
   }
 
-  return { regularFile: null, boldFile: null, usedFallback: true };
+  return { regularFile: null, boldFile: null, usedFallback: true, source: "none", loadError: "No TTF fonts found" };
 }
 
 function ensureGraphicFonts() {
@@ -474,13 +477,27 @@ function ensureGraphicFonts() {
   const picked = pickGraphicFontFiles();
   GRAPHIC_FONT_INFO = picked;
 
-  try {
-    if (picked.regularFile) PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
-    if (picked.boldFile) PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
-  } catch {}
+  if (!picked.regularFile || !picked.boldFile) {
+    graphicFontsReady = false;
+    return false;
+  }
 
-  graphicFontsReady = true;
-  return true;
+  try {
+    PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
+    PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
+    GRAPHIC_FONT_INFO.loadError = null;
+    graphicFontsReady = true;
+    return true;
+  } catch (err) {
+    GRAPHIC_FONT_INFO.loadError = String(err?.message || err || "font load failed");
+    graphicFontsReady = false;
+    return false;
+  }
+}
+
+function setGraphicFont(ctx, px, kind = "regular") {
+  const family = kind === "bold" ? GRAPHIC_FONT_BOLD : GRAPHIC_FONT_REG;
+  ctx.font = `${Math.max(1, Math.floor(px))}px ${family}`;
 }
 
 function hexToRgb(hex) {
@@ -515,19 +532,48 @@ async function loadGraphicAvatar(url) {
   if (!url) return null;
   if (graphicAvatarCache.has(url)) return graphicAvatarCache.get(url);
 
-  let img = null;
   try {
     const buf = await downloadToBuffer(url, 15000);
-    img = await decodeImageFromBuffer(buf);
+    const img = await decodeImageFromBuffer(buf);
+    if (img) {
+      graphicAvatarCache.set(url, img);
+      return img;
+    }
   } catch {}
 
-  graphicAvatarCache.set(url, img || null);
-  return img || null;
+  return null;
+}
+
+async function hydrateGraphicAvatarUrls(client) {
+  if (!client) return 0;
+  let changed = 0;
+
+  for (const [userId, rating] of Object.entries(db.ratings || {})) {
+    const current = normalizeDiscordAvatarUrl(rating?.avatarUrl || "");
+    if (current) {
+      if (current !== rating.avatarUrl) {
+        rating.avatarUrl = current;
+        changed++;
+      }
+      continue;
+    }
+
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (!user) continue;
+
+    const fresh = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
+    if (!fresh) continue;
+    rating.avatarUrl = fresh;
+    changed++;
+  }
+
+  if (changed) saveDB(db);
+  return changed;
 }
 
 async function renderGraphicTierlistPng() {
   if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
-  ensureGraphicFonts();
+  if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
 
   const state = getGraphicTierlistState();
   const buckets = buildGraphicBucketsFromRatings();
@@ -561,11 +607,11 @@ async function renderGraphicTierlistPng() {
   ctx.fillRect(0, 0, W, H);
 
   fillColor(ctx, '#ffffff');
-  ctx.font = `64px '${GRAPHIC_FONT_BOLD}'`;
+  setGraphicFont(ctx, 64, "bold");
   ctx.fillText(state.title || GRAPHIC_TIERLIST_TITLE, 40, 82);
 
   fillColor(ctx, '#cfcfcf');
-  ctx.font = `22px '${GRAPHIC_FONT_REG}'`;
+  setGraphicFont(ctx, 22, "regular");
   ctx.fillText(`players: ${entries.length}. updated: ${new Date().toLocaleString('ru-RU')}`, 40, H - 18);
 
   let yCursor = topY;
@@ -584,11 +630,11 @@ async function renderGraphicTierlistPng() {
 
     const blockH = rowH - 12;
     fillColor(ctx, '#111111');
-    ctx.font = `56px '${GRAPHIC_FONT_BOLD}'`;
+    setGraphicFont(ctx, 56, "bold");
     ctx.fillText(formatTierTitle(tierKey), 40 + 70, y + Math.floor(blockH / 2) + 18);
 
     fillColor(ctx, '#111111');
-    ctx.font = `24px '${GRAPHIC_FONT_REG}'`;
+    setGraphicFont(ctx, 24, "regular");
     ctx.fillText(`TIER ${tierKey}`, 40 + 70, y + blockH - 18);
 
     const list = buckets[tierKey] || [];
@@ -612,12 +658,18 @@ async function renderGraphicTierlistPng() {
       } else {
         fillColor(ctx, '#555555');
         ctx.fillRect(x, yy, ICON, ICON);
+        fillColor(ctx, '#f3f3f3');
+        setGraphicFont(ctx, Math.max(18, Math.floor(ICON * 0.28)), "bold");
+        const initials = String(player.name || "?").trim().split(/\s+/).slice(0, 2).map(s => s[0] || "").join("").toUpperCase() || "?";
+        const ix = x + Math.max(10, Math.floor((ICON - (initials.length * Math.max(14, Math.floor(ICON * 0.16)))) / 2));
+        const iy = yy + Math.floor(ICON / 2) + Math.max(8, Math.floor(ICON * 0.08));
+        ctx.fillText(initials, ix, iy);
       }
 
       ctx.fillStyle = 'rgba(0,0,0,0.72)';
       ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
       ctx.fillStyle = 'rgba(255,255,255,0.96)';
-      ctx.font = `24px '${GRAPHIC_FONT_BOLD}'`;
+      setGraphicFont(ctx, 24, "bold");
       const eloText = String(player.elo || 0);
       const tx = x + Math.max(8, Math.floor((ICON - (eloText.length * 14)) / 2));
       ctx.fillText(eloText, tx, yy + ICON - 8);
@@ -652,6 +704,7 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
     try { msg = await channel.messages.fetch(state.dashboardMessageId); } catch {}
   }
 
+  await hydrateGraphicAvatarUrls(client).catch(() => 0);
   const png = await renderGraphicTierlistPng();
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -693,6 +746,7 @@ async function refreshGraphicTierlist(client) {
     return true;
   }
 
+  await hydrateGraphicAvatarUrls(client).catch(() => 0);
   const png = await renderGraphicTierlistPng();
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -1292,7 +1346,9 @@ client.on("interactionCreate", async (interaction) => {
         `tierColors: ${GRAPHIC_TIER_ORDER.map(t => `${t}=${graphic.tierColors?.[t] || DEFAULT_GRAPHIC_TIER_COLORS[t]}`).join(', ')}`,
         `lastUpdated: ${graphic.lastUpdated ? new Date(graphic.lastUpdated).toLocaleString("ru-RU") : "—"}`,
         `font regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(none)"}`,
-        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`
+        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`,
+        `font source: ${GRAPHIC_FONT_INFO.source || "(none)"}`,
+        `font error: ${GRAPHIC_FONT_INFO.loadError || "(none)"}`
       ];
       await interaction.reply({ content: lines.join("\n"), ephemeral: true });
       return;
@@ -1442,13 +1498,15 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (interaction.customId === "graphic_panel_fonts") {
-        ensureGraphicFonts();
+        if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
         const files = listGraphicFontFiles();
         const lines = [
           `ttf: ${files.length ? files.map(f => path.basename(f)).join(", ") : "(none)"}`,
           `picked regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(null)"}`,
           `picked bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(null)"}`,
-          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`
+          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`,
+          `source: ${GRAPHIC_FONT_INFO.source || "(none)"}`,
+          `error: ${GRAPHIC_FONT_INFO.loadError || "(none)"}`
         ];
         await interaction.reply({ content: lines.join("\n"), ephemeral: true });
         return;
