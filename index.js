@@ -1463,7 +1463,7 @@ client.on("messageCreate", async (message) => {
 
   // невалидно -> удалить и не отправлять
   if (!attachment || !isImageAttachment(attachment) || !elo || !tier) {
-    const warn = await message.reply("Невалидно. Нужен **скрин (картинка)** и **ELO числом от 15**. Пример: `73`");
+    const warn = await message.reply("Невалидно. Нужен **скрин (картинка)** и **ELO числом от 10**. Пример: `73`");
     setTimeout(() => warn.delete().catch(() => {}), 8000);
     message.delete().catch(() => {});
     return;
