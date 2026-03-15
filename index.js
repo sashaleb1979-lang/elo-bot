@@ -115,13 +115,13 @@ function isImageAttachment(att) {
   return url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp") || url.endsWith(".gif");
 }
 
-// Тиры "ОТ": 10 / 20 / 40 / 70 / 110 (ниже 10 — невалидно)
+// Тиры "ОТ": 15 / 35 / 60 / 90 / 120 (ниже 15 — невалидно)
 function tierFor(elo) {
-  if (elo >= 110) return 5;
-  if (elo >= 70) return 4;
-  if (elo >= 40) return 3;
-  if (elo >= 20) return 2;
-  if (elo >= 10) return 1;
+  if (elo >= 120) return 5;
+  if (elo >= 90) return 4;
+  if (elo >= 60) return 3;
+  if (elo >= 35) return 2;
+  if (elo >= 15) return 1;
   return null;
 }
 
@@ -274,6 +274,64 @@ async function syncTierRolesOnStart(client) {
     if (!r?.tier) continue;
     await ensureSingleTierRole(client, uid, Number(r.tier), "sync from db");
   }
+}
+
+async function retierAllRatings(client, opts = {}) {
+  const options = {
+    syncRoles: opts.syncRoles !== false,
+    refreshCards: !!opts.refreshCards,
+  };
+
+  const entries = Object.entries(db.ratings || {});
+  let changed = 0;
+  let hidden = 0;
+  let rolesSynced = 0;
+  let cardsRefreshed = 0;
+
+  for (const [userId, rating] of entries) {
+    if (!rating) continue;
+
+    const elo = Number(rating.elo) || 0;
+    const nextTier = tierFor(elo);
+    const prevTier = rating.tier == null ? null : Number(rating.tier);
+
+    if (nextTier == null) {
+      if (prevTier !== null) changed++;
+      rating.tier = null;
+      hidden++;
+      if (options.syncRoles) {
+        await clearAllTierRoles(client, userId, "retier rebuild").catch(() => {});
+        rolesSynced++;
+      }
+      continue;
+    }
+
+    if (prevTier !== nextTier) {
+      rating.tier = nextTier;
+      changed++;
+    } else {
+      rating.tier = nextTier;
+    }
+
+    if (options.syncRoles) {
+      await ensureSingleTierRole(client, userId, nextTier, "retier rebuild").catch(() => {});
+      rolesSynced++;
+    }
+
+    if (options.refreshCards) {
+      await upsertCardMessage(client, rating, "system rebuild").catch(() => {});
+      cardsRefreshed++;
+    }
+  }
+
+  saveDB(db);
+  return {
+    total: entries.length,
+    changed,
+    hidden,
+    rolesSynced,
+    cardsRefreshed,
+  };
 }
 
 // ====== GRAPHIC TIERLIST (PNG DASHBOARD) ======
@@ -461,7 +519,6 @@ function buildGraphicBucketsFromRatings() {
     buckets[tier].push({
       userId: raw.userId,
       name: raw.name || raw.userId,
-      username: String(raw.username || "").trim() || raw.name || raw.userId,
       elo: Number(raw.elo) || 0,
       tier,
       avatarUrl: normalizeDiscordAvatarUrl(raw.avatarUrl || "")
@@ -658,40 +715,6 @@ function fitGraphicWrappedText(ctx, text, kind, maxWidth, maxHeight, startPx, mi
   return { px: minPx, lines, lineH, totalH: lines.length * lineH };
 }
 
-function trimGraphicTextToWidth(ctx, text, maxWidth) {
-  let out = String(text || "").trim();
-  if (!out) return "";
-  if (measureGraphicTextWidth(ctx, out) <= maxWidth) return out;
-  while (out.length > 1 && measureGraphicTextWidth(ctx, `${out}…`) > maxWidth) {
-    out = out.slice(0, -1).trimEnd();
-  }
-  return out.length ? `${out}…` : "";
-}
-
-function fitGraphicSingleLineText(ctx, text, kind, maxWidth, startPx, minPx = 10) {
-  const source = String(text || "").trim();
-  if (!source) return { px: minPx, text: "" };
-
-  for (let px = startPx; px >= minPx; px -= 1) {
-    setGraphicFont(ctx, px, kind);
-    if (measureGraphicTextWidth(ctx, source) <= maxWidth) return { px, text: source };
-  }
-
-  setGraphicFont(ctx, minPx, kind);
-  return { px: minPx, text: trimGraphicTextToWidth(ctx, source, maxWidth) };
-}
-
-function drawGraphicOutlinedText(ctx, text, x, y, fill = "#ffffff", outline = "#000000") {
-  const offsets = [
-    [-2, 0], [2, 0], [0, -2], [0, 2],
-    [-1, -1], [1, -1], [-1, 1], [1, 1]
-  ];
-  ctx.fillStyle = outline;
-  for (const [dx, dy] of offsets) ctx.fillText(text, x + dx, y + dy);
-  ctx.fillStyle = fill;
-  ctx.fillText(text, x, y);
-}
-
 function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
   const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
   fillColor(ctx, '#111111');
@@ -844,29 +867,6 @@ async function hydrateGraphicAvatarUrls(client) {
   return changed;
 }
 
-async function hydrateGraphicUsernames(client) {
-  if (!client) return 0;
-  let changed = 0;
-
-  for (const [userId, rating] of Object.entries(db.ratings || {})) {
-    let nextUsername = String(rating?.username || "").trim();
-
-    try {
-      const user = await client.users.fetch(userId).catch(() => null);
-      if (user?.username) nextUsername = String(user.username).trim();
-    } catch {}
-
-    if (!nextUsername) continue;
-    if (nextUsername !== rating.username) {
-      rating.username = nextUsername;
-      changed++;
-    }
-  }
-
-  if (changed) saveDB(db);
-  return changed;
-}
-
 async function renderGraphicTierlistPng(client = null) {
   if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
   if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
@@ -966,30 +966,13 @@ async function renderGraphicTierlistPng(client = null) {
         ctx.fillText(initials, ix, iy);
       }
 
-      const usernameBarH = Math.max(22, Math.floor(ICON * 0.24));
-      ctx.fillStyle = 'rgba(0,0,0,0.78)';
-      ctx.fillRect(x, yy + ICON - usernameBarH, ICON, usernameBarH);
-
-      const usernameFit = fitGraphicSingleLineText(
-        ctx,
-        String(player.username || player.name || player.userId || "").trim(),
-        "bold",
-        Math.max(10, ICON - 10),
-        Math.max(11, Math.floor(ICON * 0.18)),
-        10
-      );
-      setGraphicFont(ctx, usernameFit.px, "bold");
-      ctx.fillStyle = 'rgba(255,255,255,0.98)';
-      const usernameY = yy + ICON - Math.max(6, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
-      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, ICON), usernameY);
-
+      ctx.fillStyle = 'rgba(0,0,0,0.72)';
+      ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
+      ctx.fillStyle = 'rgba(255,255,255,0.96)';
+      setGraphicFont(ctx, 24, "bold");
       const eloText = String(player.elo || 0);
-      const eloPx = Math.max(18, Math.floor(ICON * 0.22));
-      setGraphicFont(ctx, eloPx, "bold");
-      const eloW = measureGraphicTextWidth(ctx, eloText);
-      const eloX = x + ICON - eloW - 8;
-      const eloY = yy + eloPx + 8;
-      drawGraphicOutlinedText(ctx, eloText, eloX, eloY, "#ffffff", "#000000");
+      const tx = centerGraphicTextX(ctx, eloText, x, ICON);
+      ctx.fillText(eloText, tx, yy + ICON - 8);
     }
   }
 
@@ -1022,7 +1005,6 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
   }
 
   await hydrateGraphicAvatarUrls(client).catch(() => 0);
-  await hydrateGraphicUsernames(client).catch(() => 0);
   const png = await renderGraphicTierlistPng(client);
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -1065,7 +1047,6 @@ async function refreshGraphicTierlist(client) {
   }
 
   await hydrateGraphicAvatarUrls(client).catch(() => 0);
-  await hydrateGraphicUsernames(client).catch(() => 0);
   const png = await renderGraphicTierlistPng(client);
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
@@ -1174,82 +1155,44 @@ async function fetchReviewMessage(client, sub) {
   return msg;
 }
 
-async function supersedePendingSubmissionsForUser(client, userId, moderatorTag) {
-  let changed = 0;
-  for (const sub of Object.values(db.submissions || {})) {
-    if (!sub || sub.userId !== userId || sub.status !== "pending") continue;
-    sub.status = "superseded";
-    sub.reviewedBy = moderatorTag;
-    sub.reviewedAt = new Date().toISOString();
-    sub.rejectReason = "Добавлено/обновлено модератором напрямую";
-    changed++;
-    const msg = await fetchReviewMessage(client, sub);
-    if (msg) {
-      await msg.edit({
-        embeds: [buildReviewEmbed(sub, "superseded", [{ name: "Причина", value: sub.rejectReason, inline: false }])],
-        components: [],
-      }).catch(() => {});
-    }
-  }
-  if (changed) saveDB(db);
-  return changed;
-}
-
-async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawText, moderatorTag) {
-  if (!targetUser) throw new Error("target user is required");
-  if (!screenshotAttachment || !isImageAttachment(screenshotAttachment)) {
-    throw new Error("Нужен скрин-картинка.");
-  }
-
-  const elo = parseElo(rawText);
-  const tier = elo ? tierFor(elo) : null;
-  if (!elo || !tier) {
-    throw new Error("Нужно число ELO минимум 10.");
-  }
-
-  const guild = await getGuild(client).catch(() => null);
-  const member = guild ? await guild.members.fetch(targetUser.id).catch(() => null) : null;
-  const rating = db.ratings[targetUser.id] || { userId: targetUser.id };
-
-  rating.userId = targetUser.id;
-  rating.name = member?.displayName || targetUser.username;
-  rating.username = targetUser.username;
-  rating.elo = elo;
-  rating.tier = tier;
-  rating.proofUrl = screenshotAttachment.url;
-  rating.avatarUrl = normalizeDiscordAvatarUrl(
-    (member?.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 })) ||
-    targetUser.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }) ||
-    targetUser.defaultAvatarURL ||
-    ""
-  );
-  rating.updatedAt = new Date().toISOString();
-
-  db.ratings[targetUser.id] = rating;
-  saveDB(db);
-
-  await loadGraphicAvatarForPlayer(client, rating).catch(() => null);
-  await upsertCardMessage(client, rating, moderatorTag);
-  await updateIndex(client);
-  await refreshGraphicTierlist(client).catch(() => false);
-  await ensureSingleTierRole(client, targetUser.id, tier, "Manual tier set by moderator");
-  await supersedePendingSubmissionsForUser(client, targetUser.id, moderatorTag);
-  saveDB(db);
-
-  return rating;
-}
-
 
 // ====== MINI CARDS (SUBMIT CHANNEL) ======
-// Отключено: в канале подачи больше не создаём карточки.
-function buildMiniCardEmbed() {
-  return null;
+// Маленькие "карточки" в канале подачи (#elo-submit): кто сейчас в тир-листе.
+// Требование: очень компактно, без картинок, без полей.
+function buildMiniCardEmbed(rating) {
+  return new EmbedBuilder()
+    .setDescription(`✅ **${rating.name}** добавлен в тир-лист.`);
 }
 
 async function upsertMiniCardMessage(client, rating) {
-  void client;
-  void rating;
-  return { changed: false };
+  if (!SUBMIT_CHANNEL_ID) return { changed: false };
+  const ch = await client.channels.fetch(SUBMIT_CHANNEL_ID).catch(() => null);
+  if (!ch?.isTextBased()) return { changed: false };
+
+  const embed = buildMiniCardEmbed(rating);
+  const existingId = (db.miniCards || {})[rating.userId];
+
+  if (existingId) {
+    try {
+      const msg = await ch.messages.fetch(existingId);
+      await msg.edit({ embeds: [embed] }).catch(() => {});
+      return { changed: false };
+    } catch {
+      // сообщение удалено/недоступно — пересоздадим
+      db.miniCards[rating.userId] = "";
+      saveDB(db);
+    }
+  }
+
+  const msg = await ch.send({ embeds: [embed] }).catch(() => null);
+  if (!msg) return { changed: false };
+
+  // можно закреплять, чтобы "висело" (если лимит закрепов — просто проигнорит)
+  try { await msg.pin(); } catch {}
+
+  db.miniCards[rating.userId] = msg.id;
+  saveDB(db);
+  return { changed: true };
 }
 
 async function deleteMiniCardMessage(client, userId) {
@@ -1275,16 +1218,28 @@ async function deleteMiniCardMessage(client, userId) {
 
 async function syncMiniCards(client) {
   db.miniCards ||= {};
+  const wantIds = new Set(Object.keys(db.ratings || {}));
+
+  let created = 0;
   let removed = 0;
 
+  // создать/починить отсутствующие
+  for (const uid of wantIds) {
+    const r = db.ratings[uid];
+    if (!r) continue;
+    const had = Boolean(db.miniCards[uid]);
+    const res = await upsertMiniCardMessage(client, r);
+    if (!had && res.changed) created++;
+  }
+
+  // удалить лишние (кто уже не в тир-листе)
   for (const uid of Object.keys(db.miniCards)) {
+    if (wantIds.has(uid)) continue;
     const ok = await deleteMiniCardMessage(client, uid);
     if (ok) removed++;
   }
 
-  db.miniCards = {};
-  saveDB(db);
-  return { created: 0, removed, total: Object.keys(db.ratings || {}).length };
+  return { created, removed, total: wantIds.size };
 }
 
 
@@ -1423,10 +1378,6 @@ function buildCommands() {
       .addSubcommand(s => s.setName("graphicpanel").setDescription("Панель PNG тир-листа (модеры)"))
       .addSubcommand(s => s.setName("remove").setDescription("Удалить игрока из тир-листа (модеры)")
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
-      .addSubcommand(s => s.setName("modset").setDescription("Добавить или обновить игрока напрямую (модеры)")
-        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true))
-        .addAttachmentOption(o => o.setName("screenshot").setDescription("Скрин-пруф").setRequired(true))
-        .addStringOption(o => o.setName("text").setDescription("Текст после юзернейма, из него берётся ELO").setRequired(true)))
       .addSubcommand(s => s.setName("wipe").setDescription("Очистить рейтинг полностью (модеры)")
         .addStringOption(o => o.setName("mode").setDescription("soft=только база, hard=база+удалить карточки").setRequired(true)
           .addChoices(
@@ -1440,6 +1391,7 @@ function buildCommands() {
         .addStringOption(o => o.setName("t3").setDescription("Название тира 3").setRequired(true))
         .addStringOption(o => o.setName("t4").setDescription("Название тира 4").setRequired(true))
         .addStringOption(o => o.setName("t5").setDescription("Название тира 5").setRequired(true)))
+      .addSubcommand(s => s.setName("minicards").setDescription("Пересоздать мини-карточки в submit (модеры)"))
   ].map(c => c.toJSON());
 }
 
@@ -1492,7 +1444,7 @@ client.on("messageCreate", async (message) => {
 
   // невалидно -> удалить и не отправлять
   if (!attachment || !isImageAttachment(attachment) || !elo || !tier) {
-    const warn = await message.reply("Невалидно. Нужен **скрин (картинка)** и **ELO числом от 10**. Пример: `73`");
+    const warn = await message.reply("Невалидно. Нужен **скрин (картинка)** и **ELO числом от 15**. Пример: `73`");
     setTimeout(() => warn.delete().catch(() => {}), 8000);
     message.delete().catch(() => {});
     return;
@@ -1657,9 +1609,19 @@ client.on("interactionCreate", async (interaction) => {
 
     // /elo rebuild
     if (sub === "rebuild") {
+      await interaction.deferReply({ ephemeral: true });
+      const stats = await retierAllRatings(client, { syncRoles: true, refreshCards: true });
       await updateIndex(client);
-      await refreshGraphicTierlist(client).catch(() => false);
-      await interaction.reply({ content: "Закреп пересобран. PNG тоже обновлён, если был настроен.", ephemeral: true });
+      const pngOk = await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply({
+        content:
+          `Готово. Пересчитано: **${stats.total}**. ` +
+          `Сменили тир: **${stats.changed}**. ` +
+          `Скрыто как невалидные (<10): **${stats.hidden}**. ` +
+          `Роли синкнуты: **${stats.rolesSynced}**. ` +
+          `Карточки обновлены: **${stats.cardsRefreshed}**. ` +
+          (pngOk ? `PNG тоже обновлён.` : `PNG не обновлялся.`)
+      });
       return;
     }
 
@@ -1708,28 +1670,16 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // /elo modset
-    if (sub === "modset") {
-      const target = interaction.options.getUser("target", true);
-      const screenshot = interaction.options.getAttachment("screenshot", true);
-      const rawText = interaction.options.getString("text", true);
-
-      try {
-        const rating = await upsertRatingDirect(client, target, screenshot, rawText, interaction.user.tag);
-        await interaction.reply({
-          content: `Ок. <@${target.id}> теперь в тир-листе. ELO **${rating.elo}**, тир **${rating.tier}**.`,
-          ephemeral: true,
-        });
-        await dmUser(client, target.id, `Модератор обновил твой рейтинг.
-ELO: ${rating.elo}
-Тир: ${rating.tier}
-Пруф: ${rating.proofUrl}`);
-        await logLine(client, `MODSET: <@${target.id}> ELO ${rating.elo} -> Tier ${rating.tier} by ${interaction.user.tag}`);
-      } catch (err) {
-        await interaction.reply({ content: String(err?.message || err || "Не удалось добавить игрока."), ephemeral: true });
-      }
+    // /elo minicards
+    if (sub === "minicards") {
+      const res = await syncMiniCards(client);
+      await interaction.reply({
+        content: `Мини-карточки: создано ${res.created}, удалено ${res.removed}, всего в тир-листе ${res.total}.`,
+        ephemeral: true,
+      });
       return;
     }
+
 
     // /elo labels
     if (sub === "labels") {
@@ -2035,14 +1985,14 @@ ELO: ${rating.elo}
         sub.status = "rejected";
         sub.reviewedBy = interaction.user.tag;
         sub.reviewedAt = new Date().toISOString();
-        sub.rejectReason = "ELO ниже 10";
+        sub.rejectReason = "ELO ниже 15";
         saveDB(db);
 
         await interaction.message.edit({
           embeds: [buildReviewEmbed(sub, "rejected", [{ name: "Причина", value: sub.rejectReason, inline: false }])],
           components: [],
         }).catch(() => {});
-        await interaction.reply({ content: "ELO ниже 10. Отклонено.", ephemeral: true });
+        await interaction.reply({ content: "ELO ниже 15. Отклонено.", ephemeral: true });
         return;
       }
 
@@ -2058,7 +2008,6 @@ ELO: ${rating.elo}
 
       rating.userId = sub.userId;
       rating.name = sub.name;
-      rating.username = user.username;
       rating.elo = sub.elo;
       rating.tier = tier;
       rating.proofUrl = sub.screenshotUrl;
@@ -2074,6 +2023,7 @@ ELO: ${rating.elo}
       await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
+      await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён. PNG тоже обновлён, если был настроен.", ephemeral: true });
@@ -2089,7 +2039,7 @@ ELO: ${rating.elo}
       const modal = new ModalBuilder().setCustomId(`edit_elo:${submissionId}`).setTitle("Edit ELO");
       const input = new TextInputBuilder()
         .setCustomId("elo")
-        .setLabel("Новое ELO (минимум 10)")
+        .setLabel("Новое ELO (минимум 15)")
         .setStyle(TextInputStyle.Short)
         .setRequired(true)
         .setValue(String(sub.elo));
@@ -2206,7 +2156,7 @@ ELO: ${rating.elo}
       const newTier = newElo ? tierFor(newElo) : null;
 
       if (!newElo || !newTier) {
-        await interaction.reply({ content: "Нужно число ELO минимум 10.", ephemeral: true });
+        await interaction.reply({ content: "Нужно число ELO минимум 15.", ephemeral: true });
         return;
       }
 
