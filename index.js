@@ -3,6 +3,9 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const http = require("http");
+const { PassThrough } = require("stream");
+let PImage = null;
+try { PImage = require("pureimage"); } catch {}
 
 const {
   Client,
@@ -12,6 +15,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   PermissionsBitField,
   ModalBuilder,
   TextInputBuilder,
@@ -28,6 +32,8 @@ const REVIEW_CHANNEL_ID = process.env.REVIEW_CHANNEL_ID;
 const TIERLIST_CHANNEL_ID = process.env.TIERLIST_CHANNEL_ID;
 const MOD_ROLE_ID = process.env.MOD_ROLE_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || "";
+const GRAPHIC_TIERLIST_CHANNEL_ID = process.env.GRAPHIC_TIERLIST_CHANNEL_ID || "";
+const GRAPHIC_TIERLIST_TITLE = process.env.GRAPHIC_TIERLIST_TITLE || "ELO Tier List";
 
 const SUBMIT_COOLDOWN_SECONDS = 120; // кулдаун на ВАЛИДНУЮ заявку
 const PENDING_EXPIRE_HOURS = 48;     // протухание pending
@@ -63,6 +69,28 @@ function saveDB(db) {
 const db = loadDB();
 db.config.tierLabels ||= DEFAULT_TIER_LABELS;
 db.miniCards ||= {};
+db.config.graphicTierlist ||= {
+  title: GRAPHIC_TIERLIST_TITLE,
+  dashboardChannelId: GRAPHIC_TIERLIST_CHANNEL_ID || "",
+  dashboardMessageId: "",
+  lastUpdated: 0,
+  image: { width: null, height: null, icon: null },
+  tierColors: {
+    5: "#ff6b6b",
+    4: "#ff9f43",
+    3: "#feca57",
+    2: "#1dd1a1",
+    1: "#54a0ff"
+  },
+  panel: {
+    selectedTier: 5
+  }
+};
+db.config.graphicTierlist.image ||= { width: null, height: null, icon: null };
+db.config.graphicTierlist.tierColors ||= { 5: "#ff6b6b", 4: "#ff9f43", 3: "#feca57", 2: "#1dd1a1", 1: "#54a0ff" };
+db.config.graphicTierlist.panel ||= { selectedTier: 5 };
+if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
+if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
 saveDB(db);
 
 // ====== HELPERS ======
@@ -241,6 +269,509 @@ async function syncTierRolesOnStart(client) {
     if (!r?.tier) continue;
     await ensureSingleTierRole(client, uid, Number(r.tier), "sync from db");
   }
+}
+
+// ====== GRAPHIC TIERLIST (PNG DASHBOARD) ======
+const GRAPHIC_TIER_ORDER = [5, 4, 3, 2, 1];
+const DEFAULT_GRAPHIC_TIER_COLORS = {
+  5: "#ff6b6b",
+  4: "#ff9f43",
+  3: "#feca57",
+  2: "#1dd1a1",
+  1: "#54a0ff"
+};
+let graphicFontsReady = false;
+let GRAPHIC_FONT_REG = "GraphicFontRegular";
+let GRAPHIC_FONT_BOLD = "GraphicFontBold";
+let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false };
+const graphicAvatarCache = new Map();
+
+function getGraphicTierlistState() {
+  db.config.graphicTierlist ||= {
+    title: GRAPHIC_TIERLIST_TITLE,
+    dashboardChannelId: GRAPHIC_TIERLIST_CHANNEL_ID || "",
+    dashboardMessageId: "",
+    lastUpdated: 0,
+    image: { width: null, height: null, icon: null },
+    tierColors: { ...DEFAULT_GRAPHIC_TIER_COLORS },
+    panel: {
+      selectedTier: 5
+    }
+  };
+  db.config.graphicTierlist.image ||= { width: null, height: null, icon: null };
+  db.config.graphicTierlist.tierColors ||= { ...DEFAULT_GRAPHIC_TIER_COLORS };
+  db.config.graphicTierlist.panel ||= { selectedTier: 5 };
+  if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
+  if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) {
+    db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
+  }
+  for (const t of GRAPHIC_TIER_ORDER) {
+    if (!db.config.graphicTierlist.tierColors[t]) db.config.graphicTierlist.tierColors[t] = DEFAULT_GRAPHIC_TIER_COLORS[t];
+  }
+  return db.config.graphicTierlist;
+}
+
+function getGraphicImageConfig() {
+  const state = getGraphicTierlistState();
+  const cfg = state.image || {};
+  const w = Number(cfg.width) || 2000;
+  const h = Number(cfg.height) || 1200;
+  const icon = Number(cfg.icon) || 112;
+  return {
+    W: Math.max(1200, w),
+    H: Math.max(700, h),
+    ICON: Math.max(64, icon)
+  };
+}
+
+function applyGraphicImageDelta(kind, delta) {
+  const state = getGraphicTierlistState();
+  state.image ||= { width: null, height: null, icon: null };
+  const cfg = getGraphicImageConfig();
+
+  if (kind === "icon") {
+    state.image.icon = Math.max(64, Math.min(256, cfg.ICON + delta));
+  } else if (kind === "width") {
+    state.image.width = Math.max(1200, Math.min(4096, cfg.W + delta));
+  } else if (kind === "height") {
+    state.image.height = Math.max(700, Math.min(2160, cfg.H + delta));
+  }
+}
+
+function resetGraphicImageOverrides() {
+  const state = getGraphicTierlistState();
+  state.image ||= { width: null, height: null, icon: null };
+  state.image.width = null;
+  state.image.height = null;
+  state.image.icon = null;
+}
+
+function normalizeDiscordAvatarUrl(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    const file = u.pathname || "";
+    u.pathname = file.replace(/\.(webp|gif|jpg|jpeg)$/i, ".png");
+    u.searchParams.set("size", "256");
+    return u.toString();
+  } catch {
+    return String(url).replace(/\.(webp|gif|jpg|jpeg)(\?.*)?$/i, ".png$2");
+  }
+}
+
+function normalizeHexColor(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return null;
+  const m = raw.match(/^#?([0-9a-fA-F]{6})$/);
+  if (!m) return null;
+  return `#${m[1].toLowerCase()}`;
+}
+
+function setGraphicTierColor(tier, color) {
+  const state = getGraphicTierlistState();
+  const hex = normalizeHexColor(color);
+  if (!hex) return false;
+  state.tierColors ||= { ...DEFAULT_GRAPHIC_TIER_COLORS };
+  state.tierColors[tier] = hex;
+  return true;
+}
+
+function resetGraphicTierColor(tier) {
+  const state = getGraphicTierlistState();
+  state.tierColors ||= { ...DEFAULT_GRAPHIC_TIER_COLORS };
+  state.tierColors[tier] = DEFAULT_GRAPHIC_TIER_COLORS[tier] || "#cccccc";
+}
+
+function resetAllGraphicTierColors() {
+  const state = getGraphicTierlistState();
+  state.tierColors = { ...DEFAULT_GRAPHIC_TIER_COLORS };
+}
+
+function clearGraphicAvatarCache() {
+  graphicAvatarCache.clear();
+}
+
+function buildGraphicBucketsFromRatings() {
+  const buckets = { 1: [], 2: [], 3: [], 4: [], 5: [] };
+  const entries = Object.values(db.ratings || {});
+
+  for (const raw of entries) {
+    const tier = Number(raw?.tier);
+    if (!buckets[tier]) continue;
+    buckets[tier].push({
+      userId: raw.userId,
+      name: raw.name || raw.userId,
+      elo: Number(raw.elo) || 0,
+      tier,
+      avatarUrl: normalizeDiscordAvatarUrl(raw.avatarUrl || "")
+    });
+  }
+
+  for (const t of Object.keys(buckets)) {
+    buckets[t].sort((a, b) => {
+      if ((b.elo || 0) !== (a.elo || 0)) return (b.elo || 0) - (a.elo || 0);
+      return String(a.name || "").localeCompare(String(b.name || ""), "ru");
+    });
+  }
+
+  return buckets;
+}
+
+function listGraphicFontFiles() {
+  const candidates = [
+    path.join(__dirname, "assets", "fonts"),
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation2",
+    "/usr/share/fonts/truetype/freefont"
+  ];
+
+  const out = [];
+  for (const dir of candidates) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const f of fs.readdirSync(dir)) {
+        if (f.toLowerCase().endsWith(".ttf")) out.push(path.join(dir, f));
+      }
+    } catch {}
+  }
+  return out;
+}
+
+function pickGraphicFontFiles() {
+  const preferredPairs = [
+    [
+      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
+      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf")
+    ],
+    [
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    ],
+    [
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+    ],
+  ];
+
+  for (const [regularFile, boldFile] of preferredPairs) {
+    if (fs.existsSync(regularFile) && fs.existsSync(boldFile)) {
+      return { regularFile, boldFile, usedFallback: false };
+    }
+  }
+
+  const any = listGraphicFontFiles();
+  if (any.length) {
+    return { regularFile: any[0], boldFile: any[0], usedFallback: true };
+  }
+
+  return { regularFile: null, boldFile: null, usedFallback: true };
+}
+
+function ensureGraphicFonts() {
+  if (!PImage) return false;
+  if (graphicFontsReady) return true;
+
+  const picked = pickGraphicFontFiles();
+  GRAPHIC_FONT_INFO = picked;
+
+  try {
+    if (picked.regularFile) PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
+    if (picked.boldFile) PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
+  } catch {}
+
+  graphicFontsReady = true;
+  return true;
+}
+
+function hexToRgb(hex) {
+  const h = String(hex || "#cccccc").replace("#", "");
+  const n = parseInt(h, 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+function fillColor(ctx, hex) {
+  const { r, g, b } = hexToRgb(hex);
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+}
+
+function bufferToPassThrough(buf) {
+  const s = new PassThrough();
+  s.end(buf);
+  return s;
+}
+
+async function decodeImageFromBuffer(buf) {
+  if (!PImage || !buf) return null;
+  try {
+    return await PImage.decodePNGFromStream(bufferToPassThrough(buf));
+  } catch {}
+  try {
+    return await PImage.decodeJPEGFromStream(bufferToPassThrough(buf));
+  } catch {}
+  return null;
+}
+
+async function loadGraphicAvatar(url) {
+  if (!url) return null;
+  if (graphicAvatarCache.has(url)) return graphicAvatarCache.get(url);
+
+  let img = null;
+  try {
+    const buf = await downloadToBuffer(url, 15000);
+    img = await decodeImageFromBuffer(buf);
+  } catch {}
+
+  graphicAvatarCache.set(url, img || null);
+  return img || null;
+}
+
+async function renderGraphicTierlistPng() {
+  if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
+  ensureGraphicFonts();
+
+  const state = getGraphicTierlistState();
+  const buckets = buildGraphicBucketsFromRatings();
+  const entries = Object.values(db.ratings || {});
+  const { W, H: H_CFG, ICON } = getGraphicImageConfig();
+
+  const topY = 120;
+  const leftW = Math.floor(W * 0.24);
+  const rightPadding = 36;
+  const gap = Math.max(10, Math.floor(ICON * 0.16));
+  const overlayH = Math.max(24, Math.floor(ICON * 0.24));
+  const rightW = W - leftW - rightPadding - 24;
+  const cols = Math.max(1, Math.floor((rightW + gap) / (ICON + gap)));
+
+  const rowHeights = GRAPHIC_TIER_ORDER.map((tierKey) => {
+    const n = (buckets[tierKey] || []).length;
+    const rowsNeeded = Math.max(1, Math.ceil(n / cols));
+    const iconsH = rowsNeeded * (ICON + gap) - gap;
+    const needed = 18 + iconsH + 22 + 12;
+    return Math.max(needed, 160);
+  });
+
+  const footerH = 44;
+  const neededH = topY + rowHeights.reduce((a, b) => a + b, 0) + footerH;
+  const H = Math.max(H_CFG, neededH);
+
+  const img = PImage.make(W, H);
+  const ctx = img.getContext('2d');
+
+  fillColor(ctx, '#242424');
+  ctx.fillRect(0, 0, W, H);
+
+  fillColor(ctx, '#ffffff');
+  ctx.font = `64px '${GRAPHIC_FONT_BOLD}'`;
+  ctx.fillText(state.title || GRAPHIC_TIERLIST_TITLE, 40, 82);
+
+  fillColor(ctx, '#cfcfcf');
+  ctx.font = `22px '${GRAPHIC_FONT_REG}'`;
+  ctx.fillText(`players: ${entries.length}. updated: ${new Date().toLocaleString('ru-RU')}`, 40, H - 18);
+
+  let yCursor = topY;
+
+  for (let i = 0; i < GRAPHIC_TIER_ORDER.length; i++) {
+    const tierKey = GRAPHIC_TIER_ORDER[i];
+    const y = yCursor;
+    const rowH = rowHeights[i];
+    yCursor += rowH;
+
+    fillColor(ctx, '#2f2f2f');
+    ctx.fillRect(leftW, y, W - leftW - rightPadding, rowH - 12);
+
+    fillColor(ctx, state.tierColors?.[tierKey] || '#cccccc');
+    ctx.fillRect(40, y, leftW - 40, rowH - 12);
+
+    const blockH = rowH - 12;
+    fillColor(ctx, '#111111');
+    ctx.font = `56px '${GRAPHIC_FONT_BOLD}'`;
+    ctx.fillText(formatTierTitle(tierKey), 40 + 70, y + Math.floor(blockH / 2) + 18);
+
+    fillColor(ctx, '#111111');
+    ctx.font = `24px '${GRAPHIC_FONT_REG}'`;
+    ctx.fillText(`TIER ${tierKey}`, 40 + 70, y + blockH - 18);
+
+    const list = buckets[tierKey] || [];
+    const rightX = leftW + 24;
+    const rightY = y + 18;
+
+    for (let idx = 0; idx < list.length; idx++) {
+      const player = list[idx];
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+      const x = rightX + col * (ICON + gap);
+      const yy = rightY + row * (ICON + gap);
+
+      const avatar = await loadGraphicAvatar(player.avatarUrl);
+
+      fillColor(ctx, '#171717');
+      ctx.fillRect(x - 3, yy - 3, ICON + 6, ICON + 6);
+
+      if (avatar) {
+        ctx.drawImage(avatar, x, yy, ICON, ICON);
+      } else {
+        fillColor(ctx, '#555555');
+        ctx.fillRect(x, yy, ICON, ICON);
+      }
+
+      ctx.fillStyle = 'rgba(0,0,0,0.72)';
+      ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
+      ctx.fillStyle = 'rgba(255,255,255,0.96)';
+      ctx.font = `24px '${GRAPHIC_FONT_BOLD}'`;
+      const eloText = String(player.elo || 0);
+      const tx = x + Math.max(8, Math.floor((ICON - (eloText.length * 14)) / 2));
+      ctx.fillText(eloText, tx, yy + ICON - 8);
+    }
+  }
+
+  const chunks = [];
+  const stream = new PassThrough();
+  stream.on('data', c => chunks.push(c));
+  await PImage.encodePNGToStream(img, stream);
+  stream.end();
+  return Buffer.concat(chunks);
+}
+
+function buildGraphicDashboardComponents() {
+  return [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('graphic_refresh').setLabel('Обновить PNG').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel').setLabel('PNG панель').setStyle(ButtonStyle.Primary)
+  )];
+}
+
+async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
+  const state = getGraphicTierlistState();
+  const channelId = forcedChannelId || state.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID;
+  if (!channelId) return null;
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased()) throw new Error('GRAPHIC_TIERLIST_CHANNEL_ID: не текстовый канал');
+
+  let msg = null;
+  if (state.dashboardMessageId) {
+    try { msg = await channel.messages.fetch(state.dashboardMessageId); } catch {}
+  }
+
+  const png = await renderGraphicTierlistPng();
+  const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
+  const embed = new EmbedBuilder()
+    .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
+    .setDescription('Отдельный графический тир-лист ELO. Основной embed-индекс остаётся без изменений.')
+    .setImage('attachment://elo-tierlist.png');
+
+  if (!msg) {
+    msg = await channel.send({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents() });
+    try { await msg.pin(); } catch {}
+    state.dashboardMessageId = msg.id;
+  } else {
+    await msg.edit({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents(), attachments: [] });
+  }
+
+  state.dashboardChannelId = channelId;
+  state.lastUpdated = Date.now();
+  saveDB(db);
+  return msg;
+}
+
+async function refreshGraphicTierlist(client) {
+  const state = getGraphicTierlistState();
+  if (!state.dashboardChannelId || !state.dashboardMessageId) {
+    if (GRAPHIC_TIERLIST_CHANNEL_ID) {
+      await ensureGraphicTierlistMessage(client, GRAPHIC_TIERLIST_CHANNEL_ID);
+      return true;
+    }
+    return false;
+  }
+
+  const channel = await client.channels.fetch(state.dashboardChannelId).catch(() => null);
+  if (!channel?.isTextBased()) return false;
+
+  let msg = null;
+  try { msg = await channel.messages.fetch(state.dashboardMessageId); } catch {}
+  if (!msg) {
+    await ensureGraphicTierlistMessage(client, state.dashboardChannelId);
+    return true;
+  }
+
+  const png = await renderGraphicTierlistPng();
+  const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
+  const embed = new EmbedBuilder()
+    .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
+    .setDescription('Отдельный графический тир-лист ELO. Основной embed-индекс остаётся без изменений.')
+    .setImage('attachment://elo-tierlist.png');
+
+  await msg.edit({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents(), attachments: [] });
+  state.lastUpdated = Date.now();
+  saveDB(db);
+  return true;
+}
+
+function buildGraphicPanelTierSelect() {
+  const graphic = getGraphicTierlistState();
+  const selected = Number(graphic.panel?.selectedTier) || 5;
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('graphic_panel_select_tier')
+    .setPlaceholder('Выбери тир для будущей настройки')
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(
+      GRAPHIC_TIER_ORDER.map((t) => ({ label: `Tier ${t}`, value: String(t), default: selected === t }))
+    );
+  return new ActionRowBuilder().addComponents(menu);
+}
+
+function buildGraphicPanelPayload() {
+  const graphic = getGraphicTierlistState();
+  const cfg = getGraphicImageConfig();
+  const selectedTier = Number(graphic.panel?.selectedTier) || 5;
+  const tierLabel = formatTierTitle(selectedTier);
+  const tierColor = graphic.tierColors?.[selectedTier] || DEFAULT_GRAPHIC_TIER_COLORS[selectedTier] || "#cccccc";
+
+  const e = new EmbedBuilder()
+    .setTitle('PNG Panel')
+    .setDescription([
+      `**Title:** ${graphic.title || GRAPHIC_TIERLIST_TITLE}`,
+      `**Канал:** ${graphic.dashboardChannelId ? `<#${graphic.dashboardChannelId}>` : 'не задан'}`,
+      `**Message ID:** ${graphic.dashboardMessageId || '—'}`,
+      `**Картинка:** ${cfg.W}×${cfg.H}`,
+      `**Иконки:** ${cfg.ICON}px`,
+      `**Выбранный тир:** ${selectedTier} → **${tierLabel}**`,
+      `**Цвет тира:** ${tierColor}`,
+      '',
+      'Панель меняет только PNG-контур и связанные подписи и цвета. Основной embed-индекс продолжает жить отдельно.'
+    ].join('\n'));
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('graphic_panel_refresh').setLabel('Пересобрать').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_title').setLabel('Название PNG').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('graphic_panel_rename').setLabel('Переименовать тир').setStyle(ButtonStyle.Primary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('graphic_panel_icon_minus').setLabel('Иконки -').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_icon_plus').setLabel('Иконки +').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_w_minus').setLabel('Ширина -').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_w_plus').setLabel('Ширина +').setStyle(ButtonStyle.Secondary)
+  );
+
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('graphic_panel_h_minus').setLabel('Высота -').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_h_plus').setLabel('Высота +').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_set_color').setLabel('Цвет тира').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('graphic_panel_reset_color').setLabel('Сброс цвета тира').setStyle(ButtonStyle.Secondary)
+  );
+
+  const row4 = buildGraphicPanelTierSelect();
+
+  const row5 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('graphic_panel_reset_img').setLabel('Сбросить размеры').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_reset_colors').setLabel('Сбросить все цвета').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_clear_cache').setLabel('Сбросить кэш ав').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_fonts').setLabel('Шрифты').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('graphic_panel_close').setLabel('Закрыть').setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [e], components: [row1, row2, row3, row4, row5] };
 }
 
 function hoursSince(iso) {
@@ -486,6 +1017,11 @@ function buildCommands() {
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
       .addSubcommand(s => s.setName("pending").setDescription("Показать pending заявки (модеры)"))
       .addSubcommand(s => s.setName("rebuild").setDescription("Пересобрать закреп (модеры)"))
+      .addSubcommand(s => s.setName("graphicsetup").setDescription("Создать/пересоздать PNG тир-лист в отдельном канале (модеры)")
+        .addChannelOption(o => o.setName("channel").setDescription("Канал для PNG тир-листа").setRequired(true)))
+      .addSubcommand(s => s.setName("graphicrebuild").setDescription("Пересобрать PNG тир-лист (модеры)"))
+      .addSubcommand(s => s.setName("graphicstatus").setDescription("Статус PNG тир-листа (модеры)"))
+      .addSubcommand(s => s.setName("graphicpanel").setDescription("Панель PNG тир-листа (модеры)"))
       .addSubcommand(s => s.setName("remove").setDescription("Удалить игрока из тир-листа (модеры)")
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
       .addSubcommand(s => s.setName("wipe").setDescription("Очистить рейтинг полностью (модеры)")
@@ -531,6 +1067,14 @@ client.once("ready", async () => {
   await updateIndex(client);
   await syncTierRolesOnStart(client);
   await syncMiniCards(client);
+  try {
+    const graphic = getGraphicTierlistState();
+    if (graphic.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID) {
+      await ensureGraphicTierlistMessage(client, graphic.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID);
+    }
+  } catch (e) {
+    console.error("Graphic tierlist setup failed:", e?.message || e);
+  }
 
   console.log("Ready");
 });
@@ -712,7 +1256,51 @@ client.on("interactionCreate", async (interaction) => {
     // /elo rebuild
     if (sub === "rebuild") {
       await updateIndex(client);
-      await interaction.reply({ content: "Закреп пересобран.", ephemeral: true });
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.reply({ content: "Закреп пересобран. PNG тоже обновлён, если был настроен.", ephemeral: true });
+      return;
+    }
+
+    // /elo graphicsetup
+    if (sub === "graphicsetup") {
+      const channel = interaction.options.getChannel("channel", true);
+      const graphic = getGraphicTierlistState();
+      graphic.dashboardChannelId = channel.id;
+      saveDB(db);
+      await ensureGraphicTierlistMessage(client, channel.id);
+      await interaction.reply({ content: `PNG тир-лист создан/обновлён в <#${channel.id}>.`, ephemeral: true });
+      return;
+    }
+
+    // /elo graphicrebuild
+    if (sub === "graphicrebuild") {
+      const ok = await refreshGraphicTierlist(client);
+      await interaction.reply({ content: ok ? "PNG тир-лист обновлён." : "PNG тир-лист ещё не настроен. Сначала /elo graphicsetup.", ephemeral: true });
+      return;
+    }
+
+    // /elo graphicstatus
+    if (sub === "graphicstatus") {
+      const graphic = getGraphicTierlistState();
+      const cfg = getGraphicImageConfig();
+      const lines = [
+        `title: ${graphic.title || GRAPHIC_TIERLIST_TITLE}`,
+        `channelId: ${graphic.dashboardChannelId || "—"}`,
+        `messageId: ${graphic.dashboardMessageId || "—"}`,
+        `img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON}`,
+        `selectedTier: ${graphic.panel?.selectedTier || 5} -> ${formatTierTitle(graphic.panel?.selectedTier || 5)}`,
+        `tierColors: ${GRAPHIC_TIER_ORDER.map(t => `${t}=${graphic.tierColors?.[t] || DEFAULT_GRAPHIC_TIER_COLORS[t]}`).join(', ')}`,
+        `lastUpdated: ${graphic.lastUpdated ? new Date(graphic.lastUpdated).toLocaleString("ru-RU") : "—"}`,
+        `font regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(none)"}`,
+        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`
+      ];
+      await interaction.reply({ content: lines.join("\n"), ephemeral: true });
+      return;
+    }
+
+    // /elo graphicpanel
+    if (sub === "graphicpanel") {
+      await interaction.reply({ ...buildGraphicPanelPayload(), ephemeral: true });
       return;
     }
 
@@ -738,7 +1326,8 @@ client.on("interactionCreate", async (interaction) => {
       };
       saveDB(db);
       await updateIndex(client);
-      await interaction.reply({ content: "Названия тиров обновлены.", ephemeral: true });
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.reply({ content: "Названия тиров обновлены. PNG тоже обновлён, если был настроен.", ephemeral: true });
       return;
     }
 
@@ -764,9 +1353,10 @@ client.on("interactionCreate", async (interaction) => {
       saveDB(db);
       await deleteMiniCardMessage(client, target.id);
       await updateIndex(client);
+      await refreshGraphicTierlist(client).catch(() => false);
       await clearAllTierRoles(client, target.id, "Removed from tierlist");
 
-      await interaction.reply({ content: `Удалил <@${target.id}> из тир-листа.`, ephemeral: true });
+      await interaction.reply({ content: `Удалил <@${target.id}> из тир-листа. PNG тоже обновлён, если был настроен.`, ephemeral: true });
       return;
     }
 
@@ -806,6 +1396,7 @@ client.on("interactionCreate", async (interaction) => {
       db.ratings = {};
       saveDB(db);
       await updateIndex(client);
+      await refreshGraphicTierlist(client).catch(() => false);
 
       await logLine(client, `WIPE_RATINGS (${mode}) by ${interaction.user.tag}`);
       await interaction.reply({ content: `Рейтинг очищен. mode=${mode}`, ephemeral: true });
@@ -817,6 +1408,184 @@ client.on("interactionCreate", async (interaction) => {
 
   // ---- BUTTONS ----
   if (interaction.isButton()) {
+    if (interaction.customId === "graphic_refresh") {
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      await interaction.deferReply({ ephemeral: true });
+      const ok = await refreshGraphicTierlist(client);
+      await interaction.editReply(ok ? "PNG тир-лист обновлён." : "PNG тир-лист ещё не настроен. Сначала /elo graphicsetup.");
+      return;
+    }
+
+    if (interaction.customId === "graphic_panel") {
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      await interaction.reply({ ...buildGraphicPanelPayload(), ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("graphic_panel_")) {
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+
+      const graphic = getGraphicTierlistState();
+
+      if (interaction.customId === "graphic_panel_close") {
+        await interaction.update({ content: "Ок.", embeds: [], components: [] });
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_fonts") {
+        ensureGraphicFonts();
+        const files = listGraphicFontFiles();
+        const lines = [
+          `ttf: ${files.length ? files.map(f => path.basename(f)).join(", ") : "(none)"}`,
+          `picked regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(null)"}`,
+          `picked bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(null)"}`,
+          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`
+        ];
+        await interaction.reply({ content: lines.join("\n"), ephemeral: true });
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_title") {
+        const graphic = getGraphicTierlistState();
+        const modal = new ModalBuilder()
+          .setCustomId("graphic_panel_title_modal")
+          .setTitle("Название PNG тир-листа");
+
+        const input = new TextInputBuilder()
+          .setCustomId("graphic_title")
+          .setLabel("Название наверху картинки")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(80)
+          .setValue(String(graphic.title || GRAPHIC_TIERLIST_TITLE).slice(0, 80));
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_rename") {
+        const graphic = getGraphicTierlistState();
+        const tierKey = Number(graphic.panel?.selectedTier) || 5;
+        const currentName = formatTierTitle(tierKey);
+
+        const modal = new ModalBuilder()
+          .setCustomId(`graphic_panel_rename_modal:${tierKey}`)
+          .setTitle(`Переименовать тир ${tierKey}`);
+
+        const input = new TextInputBuilder()
+          .setCustomId("tier_name")
+          .setLabel("Новое название")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(32)
+          .setValue(String(currentName).slice(0, 32));
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_set_color") {
+        const graphic = getGraphicTierlistState();
+        const tierKey = Number(graphic.panel?.selectedTier) || 5;
+        const currentColor = graphic.tierColors?.[tierKey] || DEFAULT_GRAPHIC_TIER_COLORS[tierKey] || "#cccccc";
+
+        const modal = new ModalBuilder()
+          .setCustomId(`graphic_panel_color_modal:${tierKey}`)
+          .setTitle(`Цвет тира ${tierKey}`);
+
+        const input = new TextInputBuilder()
+          .setCustomId("tier_color")
+          .setLabel("HEX цвет. пример #ff6b6b")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(7)
+          .setValue(String(currentColor).slice(0, 7));
+
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_refresh") {
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_icon_minus" || interaction.customId === "graphic_panel_icon_plus") {
+        applyGraphicImageDelta("icon", interaction.customId.endsWith("plus") ? 12 : -12);
+        saveDB(db);
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_w_minus" || interaction.customId === "graphic_panel_w_plus") {
+        applyGraphicImageDelta("width", interaction.customId.endsWith("plus") ? 200 : -200);
+        saveDB(db);
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_h_minus" || interaction.customId === "graphic_panel_h_plus") {
+        applyGraphicImageDelta("height", interaction.customId.endsWith("plus") ? 120 : -120);
+        saveDB(db);
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_reset_img") {
+        resetGraphicImageOverrides();
+        saveDB(db);
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_reset_color") {
+        const graphic = getGraphicTierlistState();
+        resetGraphicTierColor(Number(graphic.panel?.selectedTier) || 5);
+        saveDB(db);
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_reset_colors") {
+        resetAllGraphicTierColors();
+        saveDB(db);
+        await interaction.deferUpdate();
+        await refreshGraphicTierlist(client).catch(() => false);
+        await interaction.editReply(buildGraphicPanelPayload());
+        return;
+      }
+
+      if (interaction.customId === "graphic_panel_clear_cache") {
+        clearGraphicAvatarCache();
+        await interaction.reply({ content: "Кэш аватарок очищен. Следующая пересборка заново подтянет картинки.", ephemeral: true });
+        return;
+      }
+    }
+
     const [action, submissionId] = interaction.customId.split(":");
     const sub = db.submissions[submissionId];
 
@@ -872,7 +1641,7 @@ client.on("interactionCreate", async (interaction) => {
       rating.elo = sub.elo;
       rating.tier = tier;
       rating.proofUrl = sub.screenshotUrl;
-      rating.avatarUrl = user.displayAvatarURL({ size: 128 });
+      rating.avatarUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
       rating.updatedAt = new Date().toISOString();
 
       db.ratings[sub.userId] = rating;
@@ -881,11 +1650,12 @@ client.on("interactionCreate", async (interaction) => {
       await upsertCardMessage(client, rating, interaction.user.tag);
       saveDB(db);
       await updateIndex(client);
+      await refreshGraphicTierlist(client).catch(() => false);
       await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
       await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
-      await interaction.reply({ content: "Одобрено. Тир-лист обновлён.", ephemeral: true });
+      await interaction.reply({ content: "Одобрено. Тир-лист обновлён. PNG тоже обновлён, если был настроен.", ephemeral: true });
 
       await dmUser(client, sub.userId, `Одобрено.\nELO: ${sub.elo}\nТир: ${sub.tier}\nПруф: ${sub.screenshotUrl}`);
       await logLine(client, `APPROVE: <@${sub.userId}> ELO ${sub.elo} -> Tier ${sub.tier} (id ${submissionId}) by ${interaction.user.tag}`);
@@ -921,15 +1691,79 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  // ---- MODAL SUBMITS ----
-  if (interaction.isModalSubmit()) {
-    const [kind, submissionId] = interaction.customId.split(":");
-    const sub = db.submissions[submissionId];
-
+  if (interaction.isStringSelectMenu()) {
     if (!isModerator(interaction.member)) {
       await interaction.reply({ content: "Нет прав.", ephemeral: true });
       return;
     }
+
+    if (interaction.customId === "graphic_panel_select_tier") {
+      const graphic = getGraphicTierlistState();
+      graphic.panel.selectedTier = Number(interaction.values?.[0] || 5) || 5;
+      saveDB(db);
+      await interaction.update(buildGraphicPanelPayload());
+      return;
+    }
+  }
+
+  // ---- MODAL SUBMITS ----
+  if (interaction.isModalSubmit()) {
+    if (!isModerator(interaction.member)) {
+      await interaction.reply({ content: "Нет прав.", ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId === "graphic_panel_title_modal") {
+      const graphic = getGraphicTierlistState();
+      const title = (interaction.fields.getTextInputValue("graphic_title") || "").trim().slice(0, 80);
+      if (!title) {
+        await interaction.reply({ content: "Пустое название.", ephemeral: true });
+        return;
+      }
+      graphic.title = title;
+      saveDB(db);
+      await interaction.deferReply({ ephemeral: true });
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply(`Ок. Теперь PNG называется: **${title}**.`);
+      return;
+    }
+
+    if (interaction.customId.startsWith("graphic_panel_rename_modal:")) {
+      const tierKey = Number(interaction.customId.split(":")[1] || 5) || 5;
+      const name = (interaction.fields.getTextInputValue("tier_name") || "").trim().slice(0, 32);
+      if (!name) {
+        await interaction.reply({ content: "Пустое имя.", ephemeral: true });
+        return;
+      }
+      db.config.tierLabels ||= { ...DEFAULT_TIER_LABELS };
+      db.config.tierLabels[tierKey] = name;
+      saveDB(db);
+      await interaction.deferReply({ ephemeral: true });
+      await updateIndex(client);
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply(`Ок. Теперь **${tierKey}** называется: **${name}**.`);
+      return;
+    }
+
+    if (interaction.customId.startsWith("graphic_panel_color_modal:")) {
+      const tierKey = Number(interaction.customId.split(":")[1] || 5) || 5;
+      const raw = interaction.fields.getTextInputValue("tier_color");
+      const hex = normalizeHexColor(raw);
+      if (!hex) {
+        await interaction.reply({ content: "Нужен HEX цвет вида #ff6b6b", ephemeral: true });
+        return;
+      }
+      setGraphicTierColor(tierKey, hex);
+      saveDB(db);
+      await interaction.deferReply({ ephemeral: true });
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply(`Ок. Цвет тира **${tierKey}** теперь **${hex}**.`);
+      return;
+    }
+
+    const [kind, submissionId] = interaction.customId.split(":");
+    const sub = db.submissions[submissionId];
+
     if (!sub || sub.status !== "pending") {
       await interaction.reply({ content: "Заявка не найдена или уже обработана.", ephemeral: true });
       return;
