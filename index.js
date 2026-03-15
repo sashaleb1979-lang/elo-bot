@@ -115,12 +115,12 @@ function isImageAttachment(att) {
   return url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || url.endsWith(".webp") || url.endsWith(".gif");
 }
 
-// Тиры "ОТ": 10 / 20 / 40 / 70 / 110 (ниже 10 — невалидно)
+// Тиры "ОТ": 10 / 25 / 45 / 80 / 110 (ниже 10 — невалидно)
 function tierFor(elo) {
   if (elo >= 110) return 5;
-  if (elo >= 70) return 4;
-  if (elo >= 40) return 3;
-  if (elo >= 20) return 2;
+  if (elo >= 80) return 4;
+  if (elo >= 45) return 3;
+  if (elo >= 25) return 2;
   if (elo >= 10) return 1;
   return null;
 }
@@ -144,17 +144,12 @@ function sanitizeFileName(name, fallbackExt = "png") {
 }
 
 async function downloadToBuffer(url, timeoutMs = 15000) {
-  const headers = {
-    "User-Agent": "Mozilla/5.0 ChatGPTBot/1.0",
-    "Accept": "image/avif,image/webp,image/apng,image/png,image/jpeg,*/*;q=0.8"
-  };
-
   // 1) Node 18+: используем fetch
   if (typeof fetch === "function") {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { signal: controller.signal, headers });
+      const res = await fetch(url, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const ab = await res.arrayBuffer();
       return Buffer.from(ab);
@@ -166,7 +161,7 @@ async function downloadToBuffer(url, timeoutMs = 15000) {
   // 2) Fallback (Node 16/17): качаем через http/https
   return await new Promise((resolve, reject) => {
     const lib = url.startsWith("https:") ? https : http;
-    const req = lib.get(url, { headers }, (res) => {
+    const req = lib.get(url, (res) => {
       // редиректы
       if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -288,43 +283,8 @@ const DEFAULT_GRAPHIC_TIER_COLORS = {
 let graphicFontsReady = false;
 let GRAPHIC_FONT_REG = "GraphicFontRegular";
 let GRAPHIC_FONT_BOLD = "GraphicFontBold";
-let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false, source: "none", loadError: null };
+let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false };
 const graphicAvatarCache = new Map();
-const GRAPHIC_AVATAR_DISK_DIR = process.env.GRAPHIC_AVATAR_CACHE_DIR || path.join(__dirname, 'graphic_avatar_cache');
-
-function ensureGraphicAvatarDiskDir() {
-  try { fs.mkdirSync(GRAPHIC_AVATAR_DISK_DIR, { recursive: true }); } catch {}
-}
-
-function getGraphicAvatarDiskPath(userId) {
-  ensureGraphicAvatarDiskDir();
-  return path.join(GRAPHIC_AVATAR_DISK_DIR, `${String(userId || 'unknown')}.png`);
-}
-
-async function loadGraphicAvatarFromDisk(userId) {
-  if (!userId) return null;
-  const fp = getGraphicAvatarDiskPath(userId);
-  if (!fs.existsSync(fp)) return null;
-  try {
-    const buf = fs.readFileSync(fp);
-    const img = await decodeImageFromBuffer(buf);
-    if (!img) return null;
-    graphicAvatarCache.set(`disk:${userId}`, img);
-    return img;
-  } catch {
-    return null;
-  }
-}
-
-function saveGraphicAvatarBufferToDisk(userId, buf) {
-  if (!userId || !buf?.length) return false;
-  try {
-    fs.writeFileSync(getGraphicAvatarDiskPath(userId), buf);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function getGraphicTierlistState() {
   db.config.graphicTierlist ||= {
@@ -386,29 +346,16 @@ function resetGraphicImageOverrides() {
   state.image.icon = null;
 }
 
-function isDiscordCdnUrl(url) {
-  if (!url) return false;
-  try {
-    const host = new URL(url).hostname.toLowerCase();
-    return host === "cdn.discordapp.com" || host === "media.discordapp.net";
-  } catch {
-    return false;
-  }
-}
-
 function normalizeDiscordAvatarUrl(url) {
   if (!url) return "";
   try {
     const u = new URL(url);
-    if (!isDiscordCdnUrl(u.toString())) return u.toString();
     const file = u.pathname || "";
     u.pathname = file.replace(/\.(webp|gif|jpg|jpeg)$/i, ".png");
     u.searchParams.set("size", "256");
-    u.searchParams.delete("width");
-    u.searchParams.delete("height");
     return u.toString();
   } catch {
-    return String(url);
+    return String(url).replace(/\.(webp|gif|jpg|jpeg)(\?.*)?$/i, ".png$2");
   }
 }
 
@@ -442,13 +389,6 @@ function resetAllGraphicTierColors() {
 
 function clearGraphicAvatarCache() {
   graphicAvatarCache.clear();
-  try {
-    if (fs.existsSync(GRAPHIC_AVATAR_DISK_DIR)) {
-      for (const f of fs.readdirSync(GRAPHIC_AVATAR_DISK_DIR)) {
-        try { fs.unlinkSync(path.join(GRAPHIC_AVATAR_DISK_DIR, f)); } catch {}
-      }
-    }
-  } catch {}
 }
 
 function buildGraphicBucketsFromRatings() {
@@ -461,7 +401,6 @@ function buildGraphicBucketsFromRatings() {
     buckets[tier].push({
       userId: raw.userId,
       name: raw.name || raw.userId,
-      username: String(raw.username || "").trim() || raw.name || raw.userId,
       elo: Number(raw.elo) || 0,
       tier,
       avatarUrl: normalizeDiscordAvatarUrl(raw.avatarUrl || "")
@@ -501,34 +440,31 @@ function listGraphicFontFiles() {
 function pickGraphicFontFiles() {
   const preferredPairs = [
     [
+      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
+      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf")
+    ],
+    [
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-      "system-dejavu"
+      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     ],
     [
       "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-      "system-liberation"
+      "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
     ],
-    [
-      path.join(__dirname, "assets", "fonts", "NotoSans-Regular.ttf"),
-      path.join(__dirname, "assets", "fonts", "NotoSans-Bold.ttf"),
-      "repo-assets"
-    ]
   ];
 
-  for (const [regularFile, boldFile, source] of preferredPairs) {
+  for (const [regularFile, boldFile] of preferredPairs) {
     if (fs.existsSync(regularFile) && fs.existsSync(boldFile)) {
-      return { regularFile, boldFile, usedFallback: false, source, loadError: null };
+      return { regularFile, boldFile, usedFallback: false };
     }
   }
 
   const any = listGraphicFontFiles();
   if (any.length) {
-    return { regularFile: any[0], boldFile: any[0], usedFallback: true, source: "any-ttf", loadError: null };
+    return { regularFile: any[0], boldFile: any[0], usedFallback: true };
   }
 
-  return { regularFile: null, boldFile: null, usedFallback: true, source: "none", loadError: "No TTF fonts found" };
+  return { regularFile: null, boldFile: null, usedFallback: true };
 }
 
 function ensureGraphicFonts() {
@@ -538,170 +474,13 @@ function ensureGraphicFonts() {
   const picked = pickGraphicFontFiles();
   GRAPHIC_FONT_INFO = picked;
 
-  if (!picked.regularFile || !picked.boldFile) {
-    graphicFontsReady = false;
-    return false;
-  }
-
   try {
-    PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
-    PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
-    GRAPHIC_FONT_INFO.loadError = null;
-    graphicFontsReady = true;
-    return true;
-  } catch (err) {
-    GRAPHIC_FONT_INFO.loadError = String(err?.message || err || "font load failed");
-    graphicFontsReady = false;
-    return false;
-  }
-}
+    if (picked.regularFile) PImage.registerFont(picked.regularFile, GRAPHIC_FONT_REG).loadSync();
+    if (picked.boldFile) PImage.registerFont(picked.boldFile, GRAPHIC_FONT_BOLD).loadSync();
+  } catch {}
 
-function setGraphicFont(ctx, px, kind = "regular") {
-  const family = kind === "bold" ? GRAPHIC_FONT_BOLD : GRAPHIC_FONT_REG;
-  ctx.font = `${Math.max(1, Math.floor(px))}px ${family}`;
-}
-
-function measureGraphicTextWidth(ctx, text) {
-  try {
-    return Number(ctx.measureText(String(text || "")).width) || 0;
-  } catch {
-    return String(text || "").length * 12;
-  }
-}
-
-function centerGraphicTextX(ctx, text, left, width) {
-  const tw = measureGraphicTextWidth(ctx, text);
-  return Math.floor(left + Math.max(0, (width - tw) / 2));
-}
-
-function wrapGraphicTextLines(ctx, text, maxWidth, maxLines = 3) {
-  const source = String(text || "").trim();
-  if (!source) return [""];
-
-  const out = [];
-  const words = source.split(/\s+/).filter(Boolean);
-
-  function pushWordSmart(word) {
-    if (measureGraphicTextWidth(ctx, word) <= maxWidth) {
-      out.push(word);
-      return;
-    }
-
-    let chunk = "";
-    for (const ch of word) {
-      const candidate = chunk + ch;
-      if (!chunk || measureGraphicTextWidth(ctx, candidate) <= maxWidth) {
-        chunk = candidate;
-      } else {
-        out.push(chunk);
-        chunk = ch;
-      }
-    }
-    if (chunk) out.push(chunk);
-  }
-
-  const pieces = [];
-  for (const word of words) {
-    if (measureGraphicTextWidth(ctx, word) <= maxWidth) pieces.push(word);
-    else {
-      let chunk = "";
-      for (const ch of word) {
-        const candidate = chunk + ch;
-        if (!chunk || measureGraphicTextWidth(ctx, candidate) <= maxWidth) chunk = candidate;
-        else {
-          pieces.push(chunk);
-          chunk = ch;
-        }
-      }
-      if (chunk) pieces.push(chunk);
-    }
-  }
-
-  let line = "";
-  for (const part of pieces) {
-    const candidate = line ? `${line} ${part}` : part;
-    if (!line || measureGraphicTextWidth(ctx, candidate) <= maxWidth) {
-      line = candidate;
-      continue;
-    }
-    out.push(line);
-    line = part;
-  }
-  if (line) out.push(line);
-
-  if (out.length <= maxLines) return out;
-
-  const trimmed = out.slice(0, maxLines);
-  let last = trimmed[maxLines - 1];
-  while (last.length > 1 && measureGraphicTextWidth(ctx, `${last}…`) > maxWidth) {
-    last = last.slice(0, -1).trimEnd();
-  }
-  trimmed[maxLines - 1] = `${last}…`;
-  return trimmed;
-}
-
-function fitGraphicWrappedText(ctx, text, kind, maxWidth, maxHeight, startPx, minPx = 22, maxLines = 3) {
-  for (let px = startPx; px >= minPx; px -= 2) {
-    setGraphicFont(ctx, px, kind);
-    const lines = wrapGraphicTextLines(ctx, text, maxWidth, maxLines);
-    const lineH = Math.max(px + 4, Math.floor(px * 1.15));
-    const totalH = lines.length * lineH;
-    const widest = Math.max(...lines.map(line => measureGraphicTextWidth(ctx, line)), 0);
-    if (widest <= maxWidth && totalH <= maxHeight) {
-      return { px, lines, lineH, totalH };
-    }
-  }
-
-  setGraphicFont(ctx, minPx, kind);
-  const lines = wrapGraphicTextLines(ctx, text, maxWidth, maxLines);
-  const lineH = Math.max(minPx + 4, Math.floor(minPx * 1.15));
-  return { px: minPx, lines, lineH, totalH: lines.length * lineH };
-}
-
-function trimGraphicTextToWidth(ctx, text, maxWidth) {
-  let out = String(text || "").trim();
-  if (!out) return "";
-  if (measureGraphicTextWidth(ctx, out) <= maxWidth) return out;
-  while (out.length > 1 && measureGraphicTextWidth(ctx, `${out}…`) > maxWidth) {
-    out = out.slice(0, -1).trimEnd();
-  }
-  return out.length ? `${out}…` : "";
-}
-
-function fitGraphicSingleLineText(ctx, text, kind, maxWidth, startPx, minPx = 10) {
-  const source = String(text || "").trim();
-  if (!source) return { px: minPx, text: "" };
-
-  for (let px = startPx; px >= minPx; px -= 1) {
-    setGraphicFont(ctx, px, kind);
-    if (measureGraphicTextWidth(ctx, source) <= maxWidth) return { px, text: source };
-  }
-
-  setGraphicFont(ctx, minPx, kind);
-  return { px: minPx, text: trimGraphicTextToWidth(ctx, source, maxWidth) };
-}
-
-function drawGraphicOutlinedText(ctx, text, x, y, fill = "#ffffff", outline = "#000000") {
-  const offsets = [
-    [-2, 0], [2, 0], [0, -2], [0, 2],
-    [-1, -1], [1, -1], [-1, 1], [1, 1]
-  ];
-  ctx.fillStyle = outline;
-  for (const [dx, dy] of offsets) ctx.fillText(text, x + dx, y + dy);
-  ctx.fillStyle = fill;
-  ctx.fillText(text, x, y);
-}
-
-function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
-  const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
-  fillColor(ctx, '#111111');
-  setGraphicFont(ctx, fit.px, 'bold');
-
-  let y = Math.floor(boxY + Math.max(0, (boxH - fit.totalH) / 2)) + fit.px;
-  for (const line of fit.lines) {
-    ctx.fillText(line, boxX, y);
-    y += fit.lineH;
-  }
+  graphicFontsReady = true;
+  return true;
 }
 
 function hexToRgb(hex) {
@@ -732,144 +511,23 @@ async function decodeImageFromBuffer(buf) {
   return null;
 }
 
-async function fetchGraphicAvatarFromUrl(url) {
-  const normalized = normalizeDiscordAvatarUrl(url || "");
-  if (!normalized) return { img: null, buf: null, url: "" };
-  const cacheHit = graphicAvatarCache.get(normalized);
-  if (cacheHit) return { img: cacheHit, buf: null, url: normalized };
+async function loadGraphicAvatar(url) {
+  if (!url) return null;
+  if (graphicAvatarCache.has(url)) return graphicAvatarCache.get(url);
 
+  let img = null;
   try {
-    const buf = await downloadToBuffer(normalized, 15000);
-    const img = await decodeImageFromBuffer(buf);
-    if (img) {
-      graphicAvatarCache.set(normalized, img);
-      return { img, buf, url: normalized };
-    }
+    const buf = await downloadToBuffer(url, 15000);
+    img = await decodeImageFromBuffer(buf);
   } catch {}
 
-  return { img: null, buf: null, url: normalized };
+  graphicAvatarCache.set(url, img || null);
+  return img || null;
 }
 
-async function getFreshDiscordAvatarUrls(client, userId) {
-  const urls = [];
-  if (!client || !userId) return urls;
-
-  try {
-    const guild = await getGuild(client);
-    const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
-    if (member) {
-      const memberUrl = normalizeDiscordAvatarUrl(member.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
-      if (memberUrl) urls.push(memberUrl);
-      const user = member.user || null;
-      if (user) {
-        const userUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
-        const defaultUrl = normalizeDiscordAvatarUrl(user.defaultAvatarURL || "");
-        if (userUrl) urls.push(userUrl);
-        if (defaultUrl) urls.push(defaultUrl);
-      }
-    }
-  } catch {}
-
-  try {
-    const user = await client.users.fetch(userId).catch(() => null);
-    if (user) {
-      const userUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
-      const defaultUrl = normalizeDiscordAvatarUrl(user.defaultAvatarURL || "");
-      if (userUrl) urls.push(userUrl);
-      if (defaultUrl) urls.push(defaultUrl);
-    }
-  } catch {}
-
-  return [...new Set(urls.filter(Boolean))];
-}
-
-async function loadGraphicAvatarForPlayer(client, player) {
-  const userId = player?.userId || "";
-  const rating = db.ratings?.[userId];
-
-  if (userId && graphicAvatarCache.has(`disk:${userId}`)) {
-    return graphicAvatarCache.get(`disk:${userId}`);
-  }
-
-  const diskImg = await loadGraphicAvatarFromDisk(userId);
-  if (diskImg) return diskImg;
-
-  const candidates = [];
-  const push = (url) => {
-    const normalized = normalizeDiscordAvatarUrl(url || "");
-    if (normalized) candidates.push(normalized);
-  };
-
-  push(player?.avatarUrl);
-  push(rating?.avatarUrl);
-  for (const freshUrl of await getFreshDiscordAvatarUrls(client, userId)) push(freshUrl);
-
-  for (const url of [...new Set(candidates)]) {
-    const res = await fetchGraphicAvatarFromUrl(url);
-    if (!res.img) continue;
-
-    if (userId && res.buf) {
-      saveGraphicAvatarBufferToDisk(userId, res.buf);
-      graphicAvatarCache.set(`disk:${userId}`, res.img);
-    }
-
-    if (player) player.avatarUrl = res.url;
-    if (rating && rating.avatarUrl !== res.url) {
-      rating.avatarUrl = res.url;
-      rating.updatedAt = new Date().toISOString();
-      saveDB(db);
-    }
-    return res.img;
-  }
-
-  return null;
-}
-
-async function hydrateGraphicAvatarUrls(client) {
-  if (!client) return 0;
-  let changed = 0;
-
-  for (const [userId, rating] of Object.entries(db.ratings || {})) {
-    const current = normalizeDiscordAvatarUrl(rating?.avatarUrl || "");
-    const freshList = await getFreshDiscordAvatarUrls(client, userId);
-    const best = freshList[0] || current || "";
-    if (!best) continue;
-    if (best !== rating.avatarUrl) {
-      rating.avatarUrl = best;
-      changed++;
-    }
-  }
-
-  if (changed) saveDB(db);
-  return changed;
-}
-
-async function hydrateGraphicUsernames(client) {
-  if (!client) return 0;
-  let changed = 0;
-
-  for (const [userId, rating] of Object.entries(db.ratings || {})) {
-    let nextUsername = String(rating?.username || "").trim();
-
-    try {
-      const user = await client.users.fetch(userId).catch(() => null);
-      if (user?.username) nextUsername = String(user.username).trim();
-    } catch {}
-
-    if (!nextUsername) continue;
-    if (nextUsername !== rating.username) {
-      rating.username = nextUsername;
-      changed++;
-    }
-  }
-
-  if (changed) saveDB(db);
-  return changed;
-}
-
-async function renderGraphicTierlistPng(client = null) {
+async function renderGraphicTierlistPng() {
   if (!PImage) throw new Error('Не найден модуль pureimage. Установи: npm i pureimage');
-  if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
+  ensureGraphicFonts();
 
   const state = getGraphicTierlistState();
   const buckets = buildGraphicBucketsFromRatings();
@@ -903,11 +561,11 @@ async function renderGraphicTierlistPng(client = null) {
   ctx.fillRect(0, 0, W, H);
 
   fillColor(ctx, '#ffffff');
-  setGraphicFont(ctx, 64, "bold");
+  ctx.font = `64px '${GRAPHIC_FONT_BOLD}'`;
   ctx.fillText(state.title || GRAPHIC_TIERLIST_TITLE, 40, 82);
 
   fillColor(ctx, '#cfcfcf');
-  setGraphicFont(ctx, 22, "regular");
+  ctx.font = `22px '${GRAPHIC_FONT_REG}'`;
   ctx.fillText(`players: ${entries.length}. updated: ${new Date().toLocaleString('ru-RU')}`, 40, H - 18);
 
   let yCursor = topY;
@@ -925,17 +583,13 @@ async function renderGraphicTierlistPng(client = null) {
     ctx.fillRect(40, y, leftW - 40, rowH - 12);
 
     const blockH = rowH - 12;
-    const labelX = 40 + 56;
-    const labelW = (leftW - 40) - 56 - 18;
-    const bottomLabelY = y + blockH - 18;
-    const titleBoxY = y + 16;
-    const titleBoxH = Math.max(44, bottomLabelY - titleBoxY - 18);
-
-    drawGraphicTierTitle(ctx, formatTierTitle(tierKey), labelX, titleBoxY, labelW, titleBoxH);
+    fillColor(ctx, '#111111');
+    ctx.font = `56px '${GRAPHIC_FONT_BOLD}'`;
+    ctx.fillText(formatTierTitle(tierKey), 40 + 70, y + Math.floor(blockH / 2) + 18);
 
     fillColor(ctx, '#111111');
-    setGraphicFont(ctx, 24, "regular");
-    ctx.fillText(`TIER ${tierKey}`, labelX, bottomLabelY);
+    ctx.font = `24px '${GRAPHIC_FONT_REG}'`;
+    ctx.fillText(`TIER ${tierKey}`, 40 + 70, y + blockH - 18);
 
     const list = buckets[tierKey] || [];
     const rightX = leftW + 24;
@@ -948,7 +602,7 @@ async function renderGraphicTierlistPng(client = null) {
       const x = rightX + col * (ICON + gap);
       const yy = rightY + row * (ICON + gap);
 
-      const avatar = await loadGraphicAvatarForPlayer(client, player);
+      const avatar = await loadGraphicAvatar(player.avatarUrl);
 
       fillColor(ctx, '#171717');
       ctx.fillRect(x - 3, yy - 3, ICON + 6, ICON + 6);
@@ -958,38 +612,15 @@ async function renderGraphicTierlistPng(client = null) {
       } else {
         fillColor(ctx, '#555555');
         ctx.fillRect(x, yy, ICON, ICON);
-        fillColor(ctx, '#f3f3f3');
-        setGraphicFont(ctx, Math.max(18, Math.floor(ICON * 0.28)), "bold");
-        const initials = String(player.name || "?").trim().split(/\s+/).slice(0, 2).map(s => s[0] || "").join("").toUpperCase() || "?";
-        const ix = x + Math.max(10, Math.floor((ICON - (initials.length * Math.max(14, Math.floor(ICON * 0.16)))) / 2));
-        const iy = yy + Math.floor(ICON / 2) + Math.max(8, Math.floor(ICON * 0.08));
-        ctx.fillText(initials, ix, iy);
       }
 
-      const usernameBarH = Math.max(22, Math.floor(ICON * 0.24));
-      ctx.fillStyle = 'rgba(0,0,0,0.78)';
-      ctx.fillRect(x, yy + ICON - usernameBarH, ICON, usernameBarH);
-
-      const usernameFit = fitGraphicSingleLineText(
-        ctx,
-        String(player.username || player.name || player.userId || "").trim(),
-        "bold",
-        Math.max(10, ICON - 10),
-        Math.max(11, Math.floor(ICON * 0.18)),
-        10
-      );
-      setGraphicFont(ctx, usernameFit.px, "bold");
-      ctx.fillStyle = 'rgba(255,255,255,0.98)';
-      const usernameY = yy + ICON - Math.max(6, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
-      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, ICON), usernameY);
-
+      ctx.fillStyle = 'rgba(0,0,0,0.72)';
+      ctx.fillRect(x, yy + ICON - overlayH, ICON, overlayH);
+      ctx.fillStyle = 'rgba(255,255,255,0.96)';
+      ctx.font = `24px '${GRAPHIC_FONT_BOLD}'`;
       const eloText = String(player.elo || 0);
-      const eloPx = Math.max(18, Math.floor(ICON * 0.22));
-      setGraphicFont(ctx, eloPx, "bold");
-      const eloW = measureGraphicTextWidth(ctx, eloText);
-      const eloX = x + ICON - eloW - 8;
-      const eloY = yy + eloPx + 8;
-      drawGraphicOutlinedText(ctx, eloText, eloX, eloY, "#ffffff", "#000000");
+      const tx = x + Math.max(8, Math.floor((ICON - (eloText.length * 14)) / 2));
+      ctx.fillText(eloText, tx, yy + ICON - 8);
     }
   }
 
@@ -1021,9 +652,7 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
     try { msg = await channel.messages.fetch(state.dashboardMessageId); } catch {}
   }
 
-  await hydrateGraphicAvatarUrls(client).catch(() => 0);
-  await hydrateGraphicUsernames(client).catch(() => 0);
-  const png = await renderGraphicTierlistPng(client);
+  const png = await renderGraphicTierlistPng();
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
     .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
@@ -1064,9 +693,7 @@ async function refreshGraphicTierlist(client) {
     return true;
   }
 
-  await hydrateGraphicAvatarUrls(client).catch(() => 0);
-  await hydrateGraphicUsernames(client).catch(() => 0);
-  const png = await renderGraphicTierlistPng(client);
+  const png = await renderGraphicTierlistPng();
   const attachment = new AttachmentBuilder(png, { name: 'elo-tierlist.png' });
   const embed = new EmbedBuilder()
     .setTitle(state.title || GRAPHIC_TIERLIST_TITLE)
@@ -1174,15 +801,14 @@ async function fetchReviewMessage(client, sub) {
   return msg;
 }
 
-async function supersedePendingSubmissionsForUser(client, userId, moderatorTag) {
-  let changed = 0;
-  for (const sub of Object.values(db.submissions || {})) {
-    if (!sub || sub.userId !== userId || sub.status !== "pending") continue;
+
+async function supersedePendingSubmissionsForUser(client, userId, moderatorTag = "system") {
+  const pending = Object.values(db.submissions || {}).filter((s) => s.userId === userId && s.status === "pending");
+  for (const sub of pending) {
     sub.status = "superseded";
     sub.reviewedBy = moderatorTag;
     sub.reviewedAt = new Date().toISOString();
-    sub.rejectReason = "Добавлено/обновлено модератором напрямую";
-    changed++;
+    sub.rejectReason = "Обновлено модератором вручную";
     const msg = await fetchReviewMessage(client, sub);
     if (msg) {
       await msg.edit({
@@ -1191,12 +817,11 @@ async function supersedePendingSubmissionsForUser(client, userId, moderatorTag) 
       }).catch(() => {});
     }
   }
-  if (changed) saveDB(db);
-  return changed;
+  saveDB(db);
 }
 
 async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawText, moderatorTag) {
-  if (!targetUser) throw new Error("target user is required");
+  if (!targetUser) throw new Error("Не выбран игрок.");
   if (!screenshotAttachment || !isImageAttachment(screenshotAttachment)) {
     throw new Error("Нужен скрин-картинка.");
   }
@@ -1228,16 +853,17 @@ async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawT
   db.ratings[targetUser.id] = rating;
   saveDB(db);
 
-  await loadGraphicAvatarForPlayer(client, rating).catch(() => null);
   await upsertCardMessage(client, rating, moderatorTag);
   await updateIndex(client);
   await refreshGraphicTierlist(client).catch(() => false);
   await ensureSingleTierRole(client, targetUser.id, tier, "Manual tier set by moderator");
+  await deleteMiniCardMessage(client, targetUser.id).catch(() => false);
   await supersedePendingSubmissionsForUser(client, targetUser.id, moderatorTag);
   saveDB(db);
 
   return rating;
 }
+
 
 
 // ====== MINI CARDS (SUBMIT CHANNEL) ======
@@ -1286,7 +912,6 @@ async function syncMiniCards(client) {
   saveDB(db);
   return { created: 0, removed, total: Object.keys(db.ratings || {}).length };
 }
-
 
 // ====== TIERLIST INDEX ======
 async function ensureIndexMessage(client) {
@@ -1344,6 +969,68 @@ function buildIndexEmbed() {
 async function updateIndex(client) {
   const indexMsg = await ensureIndexMessage(client);
   await indexMsg.edit({ embeds: [buildIndexEmbed()] });
+}
+
+async function deleteRatingCardMessage(client, rating) {
+  if (!rating?.cardMessageId) return false;
+  const ch = await client.channels.fetch(TIERLIST_CHANNEL_ID).catch(() => null);
+  if (!ch?.isTextBased()) {
+    rating.cardMessageId = "";
+    return false;
+  }
+  const msg = await ch.messages.fetch(rating.cardMessageId).catch(() => null);
+  if (msg) await msg.delete().catch(() => {});
+  rating.cardMessageId = "";
+  return !!msg;
+}
+
+async function rebuildEloTierlist(client) {
+  const ids = Object.keys(db.ratings || {});
+  let total = 0;
+  let retiered = 0;
+  let hidden = 0;
+  let rolesSynced = 0;
+  let cardsUpdated = 0;
+  let cardsDeleted = 0;
+  let miniTouched = 0;
+
+  for (const uid of ids) {
+    const rating = db.ratings[uid];
+    if (!rating) continue;
+    total++;
+
+    const elo = Number(rating.elo) || 0;
+    const prevTier = Number.isFinite(Number(rating.tier)) ? Number(rating.tier) : null;
+    const nextTier = tierFor(elo);
+
+    if (prevTier !== nextTier) retiered++;
+    rating.tier = nextTier;
+    rating.updatedAt = new Date().toISOString();
+
+    if (!nextTier) {
+      hidden++;
+      if (await deleteRatingCardMessage(client, rating)) cardsDeleted++;
+      await clearAllTierRoles(client, uid, "Rebuild invalid rating");
+      rolesSynced++;
+      const miniDeleted = await deleteMiniCardMessage(client, uid).catch(() => false);
+      if (miniDeleted) miniTouched++;
+      continue;
+    }
+
+    await upsertCardMessage(client, rating, "rebuild");
+    cardsUpdated++;
+    await ensureSingleTierRole(client, uid, nextTier, "Rebuild retier");
+    rolesSynced++;
+    const miniRes = await upsertMiniCardMessage(client, rating).catch(() => ({ changed: false }));
+    if (miniRes?.changed) miniTouched++;
+  }
+
+  saveDB(db);
+  await updateIndex(client);
+  const pngUpdated = await refreshGraphicTierlist(client).catch(() => false);
+  saveDB(db);
+
+  return { total, retiered, hidden, rolesSynced, cardsUpdated, cardsDeleted, miniTouched, pngUpdated };
 }
 
 async function upsertCardMessage(client, rating, approvedByTag) {
@@ -1423,10 +1110,6 @@ function buildCommands() {
       .addSubcommand(s => s.setName("graphicpanel").setDescription("Панель PNG тир-листа (модеры)"))
       .addSubcommand(s => s.setName("remove").setDescription("Удалить игрока из тир-листа (модеры)")
         .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true)))
-      .addSubcommand(s => s.setName("modset").setDescription("Добавить или обновить игрока напрямую (модеры)")
-        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true))
-        .addAttachmentOption(o => o.setName("screenshot").setDescription("Скрин-пруф").setRequired(true))
-        .addStringOption(o => o.setName("text").setDescription("Текст после юзернейма, из него берётся ELO").setRequired(true)))
       .addSubcommand(s => s.setName("wipe").setDescription("Очистить рейтинг полностью (модеры)")
         .addStringOption(o => o.setName("mode").setDescription("soft=только база, hard=база+удалить карточки").setRequired(true)
           .addChoices(
@@ -1440,6 +1123,10 @@ function buildCommands() {
         .addStringOption(o => o.setName("t3").setDescription("Название тира 3").setRequired(true))
         .addStringOption(o => o.setName("t4").setDescription("Название тира 4").setRequired(true))
         .addStringOption(o => o.setName("t5").setDescription("Название тира 5").setRequired(true)))
+      .addSubcommand(s => s.setName("modset").setDescription("Добавить или обновить игрока вручную (модеры)")
+        .addUserOption(o => o.setName("target").setDescription("Игрок").setRequired(true))
+        .addAttachmentOption(o => o.setName("screenshot").setDescription("Скриншот-пруф").setRequired(true))
+        .addStringOption(o => o.setName("text").setDescription("Текст с числом ELO. пример: 87 elo").setRequired(true)))
   ].map(c => c.toJSON());
 }
 
@@ -1657,9 +1344,19 @@ client.on("interactionCreate", async (interaction) => {
 
     // /elo rebuild
     if (sub === "rebuild") {
-      await updateIndex(client);
-      await refreshGraphicTierlist(client).catch(() => false);
-      await interaction.reply({ content: "Закреп пересобран. PNG тоже обновлён, если был настроен.", ephemeral: true });
+      await interaction.deferReply({ ephemeral: true });
+      const res = await rebuildEloTierlist(client);
+      const lines = [
+        `Готово. Проверено: ${res.total}`,
+        `Сменили тир: ${res.retiered}`,
+        `Скрыто как невалидные: ${res.hidden}`,
+        `Роли синкнуты: ${res.rolesSynced}`,
+        `Карточки обновлены: ${res.cardsUpdated}`,
+        `Карточки удалены: ${res.cardsDeleted}`,
+        `Мини-карточки затронуты: ${res.miniTouched}`,
+        `PNG: ${res.pngUpdated ? "обновлён" : "не настроен или пропущен"}`
+      ];
+      await interaction.editReply({ content: lines.join("\n") });
       return;
     }
 
@@ -1694,9 +1391,7 @@ client.on("interactionCreate", async (interaction) => {
         `tierColors: ${GRAPHIC_TIER_ORDER.map(t => `${t}=${graphic.tierColors?.[t] || DEFAULT_GRAPHIC_TIER_COLORS[t]}`).join(', ')}`,
         `lastUpdated: ${graphic.lastUpdated ? new Date(graphic.lastUpdated).toLocaleString("ru-RU") : "—"}`,
         `font regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(none)"}`,
-        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`,
-        `font source: ${GRAPHIC_FONT_INFO.source || "(none)"}`,
-        `font error: ${GRAPHIC_FONT_INFO.loadError || "(none)"}`
+        `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`
       ];
       await interaction.reply({ content: lines.join("\n"), ephemeral: true });
       return;
@@ -1708,28 +1403,33 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // /elo modset
-    if (sub === "modset") {
-      const target = interaction.options.getUser("target", true);
-      const screenshot = interaction.options.getAttachment("screenshot", true);
-      const rawText = interaction.options.getString("text", true);
 
-      try {
-        const rating = await upsertRatingDirect(client, target, screenshot, rawText, interaction.user.tag);
-        await interaction.reply({
-          content: `Ок. <@${target.id}> теперь в тир-листе. ELO **${rating.elo}**, тир **${rating.tier}**.`,
-          ephemeral: true,
-        });
-        await dmUser(client, target.id, `Модератор обновил твой рейтинг.
-ELO: ${rating.elo}
-Тир: ${rating.tier}
-Пруф: ${rating.proofUrl}`);
-        await logLine(client, `MODSET: <@${target.id}> ELO ${rating.elo} -> Tier ${rating.tier} by ${interaction.user.tag}`);
-      } catch (err) {
-        await interaction.reply({ content: String(err?.message || err || "Не удалось добавить игрока."), ephemeral: true });
-      }
-      return;
-    }
+// /elo modset
+if (sub === "modset") {
+  const target = interaction.options.getUser("target", true);
+  const screenshot = interaction.options.getAttachment("screenshot", true);
+  const rawText = interaction.options.getString("text", true);
+
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    const rating = await upsertRatingDirect(client, target, screenshot, rawText, interaction.user.tag);
+    await interaction.editReply({
+      content:
+        `Ок. Обновил <@${rating.userId}>
+` +
+        `username: **${rating.username || target.username}**
+` +
+        `ELO: **${rating.elo}**
+` +
+        `Тир: **${rating.tier}** (${formatTierTitle(rating.tier)})`
+    });
+  } catch (e) {
+    await interaction.editReply({ content: `Ошибка: ${e?.message || e}` });
+  }
+  return;
+}
+
+
 
     // /elo labels
     if (sub === "labels") {
@@ -1858,15 +1558,13 @@ ELO: ${rating.elo}
       }
 
       if (interaction.customId === "graphic_panel_fonts") {
-        if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
+        ensureGraphicFonts();
         const files = listGraphicFontFiles();
         const lines = [
           `ttf: ${files.length ? files.map(f => path.basename(f)).join(", ") : "(none)"}`,
           `picked regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(null)"}`,
           `picked bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(null)"}`,
-          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`,
-          `source: ${GRAPHIC_FONT_INFO.source || "(none)"}`,
-          `error: ${GRAPHIC_FONT_INFO.loadError || "(none)"}`
+          `fallback: ${GRAPHIC_FONT_INFO.usedFallback}`
         ];
         await interaction.reply({ content: lines.join("\n"), ephemeral: true });
         return;
@@ -2052,28 +1750,25 @@ ELO: ${rating.elo}
       sub.reviewedAt = new Date().toISOString();
 
       const user = await client.users.fetch(sub.userId);
-      const guild = await getGuild(client).catch(() => null);
-      const member = guild ? await guild.members.fetch(sub.userId).catch(() => null) : null;
       const rating = db.ratings[sub.userId] || { userId: sub.userId };
 
       rating.userId = sub.userId;
       rating.name = sub.name;
-      rating.username = user.username;
       rating.elo = sub.elo;
       rating.tier = tier;
       rating.proofUrl = sub.screenshotUrl;
-      rating.avatarUrl = normalizeDiscordAvatarUrl((member?.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 })) || user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }) || user.defaultAvatarURL || "");
+      rating.avatarUrl = normalizeDiscordAvatarUrl(user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }));
       rating.updatedAt = new Date().toISOString();
 
       db.ratings[sub.userId] = rating;
       saveDB(db);
-      await loadGraphicAvatarForPlayer(client, rating).catch(() => null);
 
       await upsertCardMessage(client, rating, interaction.user.tag);
       saveDB(db);
       await updateIndex(client);
       await refreshGraphicTierlist(client).catch(() => false);
       await ensureSingleTierRole(client, sub.userId, tier, "Approved tier role");
+      await upsertMiniCardMessage(client, rating);
 
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён. PNG тоже обновлён, если был настроен.", ephemeral: true });
