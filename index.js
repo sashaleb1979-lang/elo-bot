@@ -1315,10 +1315,10 @@ function buildSubmitHubEmbed() {
   return new EmbedBuilder()
     .setTitle("ELO заявки")
     .setDescription([
-      "Нажми **Отправить заявку ELO**.",
-      "Потом нажми **Начать** и введи текст с числом ELO.",
-      "После этого либо вставь ссылку на картинку в модалку, либо просто отправь **одним следующим сообщением** изображение в этот канал.",
-      "Бот сам проверит данные, удалит служебные сообщения и отправит заявку на рассмотрение."
+      "Тут уже есть вся инструкция.",
+      "Жми **Отправить заявку ELO** и сразу вводи текст с числом ELO.",
+      "После этого просто отправь **следующим сообщением** скрин в этот канал.",
+      "Можно обычным вложением или просто вставить картинку из буфера обмена через **Ctrl+V**."
     ].join("\n"));
 }
 
@@ -1331,54 +1331,98 @@ function buildSubmitHubComponents() {
   ];
 }
 
-function buildSubmitStartEmbed() {
-  return new EmbedBuilder()
-    .setTitle("Подача ELO заявки")
-    .setDescription([
-      "1. Нажми **Начать**.",
-      "2. Введи текст, где есть число ELO.",
-      "3. Во второе поле можешь вставить **ссылку на изображение**.",
-      "4. Если ссылку не вставил, после модалки отправь **одним следующим сообщением** картинку в этот канал.",
-      "5. Бот сам удалит временные сообщения и передаст заявку модерам."
-    ].join("\n"));
+function formatRuDateTime(value) {
+  if (!value) return null;
+  const ts = Date.parse(value);
+  if (!Number.isFinite(ts)) return null;
+  return new Date(ts).toLocaleString("ru-RU");
 }
 
-function buildSubmitStartComponents() {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("elo_submit_start").setLabel("Начать").setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId("elo_submit_cancel").setLabel("Отмена").setStyle(ButtonStyle.Secondary)
-    )
-  ];
+function getLatestSubmissionForUser(userId, allowedStatuses = null) {
+  const list = Object.values(db.submissions || {}).filter((sub) => {
+    if (!sub || sub.userId !== userId) return false;
+    if (!allowedStatuses || !allowedStatuses.length) return true;
+    return allowedStatuses.includes(sub.status);
+  });
+
+  list.sort((a, b) => {
+    const ta = Date.parse(b.reviewedAt || b.createdAt || 0) || 0;
+    const tb = Date.parse(a.reviewedAt || a.createdAt || 0) || 0;
+    return ta - tb;
+  });
+
+  return list[0] || null;
 }
 
-function buildMyCardText(userId) {
+async function fetchSubmissionProofUrl(client, sub, fallbackUrl = "") {
+  if (!sub) return fallbackUrl || "";
+  if (sub.reviewAttachmentUrl) return sub.reviewAttachmentUrl;
+
+  const msg = await fetchReviewMessage(client, sub).catch(() => null);
+  const attUrl = msg?.attachments?.first?.()?.url || "";
+  if (attUrl) {
+    sub.reviewAttachmentUrl = attUrl;
+    if (!sub.reviewImage || String(sub.reviewImage).startsWith("attachment://")) {
+      sub.reviewImage = attUrl;
+    }
+    saveDB(db);
+    return attUrl;
+  }
+
+  return fallbackUrl || sub.screenshotUrl || "";
+}
+
+async function buildMyCardPayload(client, userId) {
   const rating = db.ratings[userId];
   const pending = getPendingSubmissionForUser(userId);
   const session = getActiveSubmitSession(userId);
 
   if (rating) {
-    return [
-      `Ты в тир-листе.`,
-      `ELO: **${rating.elo}**`,
-      `Тир: **${rating.tier}** (${formatTierTitle(rating.tier)})`,
-      rating.updatedAt ? `Обновлено: ${new Date(rating.updatedAt).toLocaleString("ru-RU")}` : null
-    ].filter(Boolean).join("\n");
+    const approvedSub = getLatestSubmissionForUser(userId, ["approved"]);
+    const proofUrl = await fetchSubmissionProofUrl(client, approvedSub, rating.proofUrl || "");
+    const embed = new EmbedBuilder()
+      .setTitle("Моя ELO карточка")
+      .setDescription([
+        "Статус: **в тир-листе**",
+        `ELO: **${rating.elo}**`,
+        `Тир: **${rating.tier}** (${formatTierTitle(rating.tier)})`,
+        rating.updatedAt ? `Обновлено: **${formatRuDateTime(rating.updatedAt)}**` : null,
+        proofUrl ? `[Открыть скрин](${proofUrl})` : null
+      ].filter(Boolean).join("\n"));
+
+    if (rating.avatarUrl) embed.setThumbnail(rating.avatarUrl);
+    if (proofUrl) embed.setImage(proofUrl);
+    return { embeds: [embed], ephemeral: true };
   }
 
   if (pending) {
-    return [
-      "У тебя уже есть заявка на проверке.",
-      `ELO: **${pending.elo}**`,
-      `ID: \`${pending.id}\``
-    ].join("\n");
+    const proofUrl = await fetchSubmissionProofUrl(client, pending, pending.screenshotUrl || "");
+    const embed = new EmbedBuilder()
+      .setTitle("Моя ELO карточка")
+      .setDescription([
+        "Статус: **заявка на проверке**",
+        `ELO: **${pending.elo}**`,
+        `Тир по числу: **${pending.tier}** (${formatTierTitle(pending.tier)})`,
+        `ID: \`${pending.id}\``,
+        pending.createdAt ? `Создано: **${formatRuDateTime(pending.createdAt)}**` : null,
+        proofUrl ? `[Открыть скрин](${proofUrl})` : null
+      ].filter(Boolean).join("\n"));
+
+    if (proofUrl) embed.setImage(proofUrl);
+    return { embeds: [embed], ephemeral: true };
   }
 
   if (session) {
-    return "У тебя уже начат шаг отправки. Просто пришли одним следующим сообщением картинку в этот канал.";
+    return {
+      content: "Текст уже принят. Теперь просто отправь **одним следующим сообщением** скрин в этот канал. Можно вставить картинку из буфера через **Ctrl+V**.",
+      ephemeral: true
+    };
   }
 
-  return "Тебя пока нет в тир-листе и активной заявки тоже нет.";
+  return {
+    content: "Тебя пока нет в тир-листе и активной заявки тоже нет.",
+    ephemeral: true
+  };
 }
 
 async function ensureSubmitHubMessage(client, forcedChannelId = null) {
@@ -1457,6 +1501,12 @@ async function createPendingSubmissionFromUrl(client, { user, member, rawText, s
 
   const sub = db.submissions[submissionId];
   const sent = await postReviewRecord(client, sub, reviewFile, "pending", [], [buildReviewButtons(submissionId)]);
+  if (sent?.attachments?.first?.()?.url) {
+    sub.reviewAttachmentUrl = sent.attachments.first().url;
+    if (!sub.reviewImage || String(sub.reviewImage).startsWith("attachment://")) {
+      sub.reviewImage = sub.reviewAttachmentUrl;
+    }
+  }
   if (!sent) {
     delete db.submissions[submissionId];
     if (prevCooldown) db.cooldowns[user.id] = prevCooldown;
@@ -1535,7 +1585,11 @@ async function upsertRatingDirect(client, targetUser, screenshotAttachment, rawT
   await refreshGraphicTierlist(client).catch(() => false);
   await ensureSingleTierRole(client, targetUser.id, tier, "Manual tier set by moderator");
   await supersedePendingSubmissionsForUser(client, targetUser.id, moderatorTag);
-  await createManualApprovedReviewRecord(client, targetUser, screenshotAttachment, elo, tier, moderatorTag).catch(() => null);
+  const manualSub = await createManualApprovedReviewRecord(client, targetUser, screenshotAttachment, elo, tier, moderatorTag).catch(() => null);
+  if (manualSub?.reviewAttachmentUrl) {
+    rating.proofUrl = manualSub.reviewAttachmentUrl;
+    db.ratings[targetUser.id] = rating;
+  }
   saveDB(db);
 
   return rating;
@@ -1642,7 +1696,7 @@ async function createManualApprovedReviewRecord(client, targetUser, screenshotAt
 
   db.submissions[submissionId] = sub;
   saveDB(db);
-  await postReviewRecord(
+  const sent = await postReviewRecord(
     client,
     sub,
     reviewFile,
@@ -1650,6 +1704,12 @@ async function createManualApprovedReviewRecord(client, targetUser, screenshotAt
     [{ name: "Источник", value: `Ручное добавление модератором: ${moderatorTag}`, inline: false }],
     []
   );
+  if (sent?.attachments?.first?.()?.url) {
+    sub.reviewAttachmentUrl = sent.attachments.first().url;
+    if (!sub.reviewImage || String(sub.reviewImage).startsWith("attachment://")) {
+      sub.reviewImage = sub.reviewAttachmentUrl;
+    }
+  }
   saveDB(db);
   return sub;
 }
@@ -1846,7 +1906,7 @@ client.on("messageCreate", async (message) => {
 
   const attachment = message.attachments.first();
   if (!attachment || !isImageAttachment(attachment)) {
-    const warn = await message.reply("Сейчас нужен **один следующий месседж именно с картинкой**. Текст уже сохранён.").catch(() => null);
+    const warn = await message.reply("Сейчас нужен **один следующий месседж именно с картинкой**. Можно просто вставить скрин из буфера через **Ctrl+V**. Текст уже сохранён.").catch(() => null);
     if (warn) scheduleDeleteMessage(warn);
     await message.delete().catch(() => {});
     return;
@@ -2109,11 +2169,11 @@ ELO: ${rating.elo}
 
   // ---- BUTTONS ----
   if (interaction.isButton()) {
-    if (interaction.customId === "elo_submit_open") {
+    if (interaction.customId === "elo_submit_open" || interaction.customId === "elo_submit_start") {
       const session = getActiveSubmitSession(interaction.user.id);
       if (session) {
         await interaction.reply({
-          content: "У тебя уже начат шаг отправки. Просто пришли одним следующим сообщением картинку в этот канал.",
+          content: "У тебя уже начат шаг отправки. Просто пришли одним следующим сообщением картинку в этот канал. Можно вставить её из буфера через **Ctrl+V**.",
           ephemeral: true
         });
         scheduleDeleteInteractionReply(interaction);
@@ -2127,38 +2187,7 @@ ELO: ${rating.elo}
         return;
       }
 
-      await interaction.reply({
-        embeds: [buildSubmitStartEmbed()],
-        components: buildSubmitStartComponents(),
-        ephemeral: true
-      });
-      scheduleDeleteInteractionReply(interaction);
-      return;
-    }
-
-    if (interaction.customId === "elo_submit_card") {
-      await interaction.reply({ content: buildMyCardText(interaction.user.id), ephemeral: true });
-      scheduleDeleteInteractionReply(interaction);
-      return;
-    }
-
-    if (interaction.customId === "elo_submit_cancel") {
-      clearSubmitSession(interaction.user.id);
-      await interaction.update({ content: "Ок. Отменено.", embeds: [], components: [] });
-      scheduleDeleteInteractionReply(interaction);
-      return;
-    }
-
-    if (interaction.customId === "elo_submit_start") {
-      const blockReason = getSubmitEligibilityError(interaction.user.id);
-      if (blockReason) {
-        await interaction.reply({ content: blockReason, ephemeral: true });
-        scheduleDeleteInteractionReply(interaction);
-        return;
-      }
-
       const modal = new ModalBuilder().setCustomId("elo_submit_modal").setTitle("ELO заявка");
-
       const textInput = new TextInputBuilder()
         .setCustomId("elo_submit_text")
         .setLabel("Текст с числом ELO")
@@ -2167,20 +2196,21 @@ ELO: ${rating.elo}
         .setMaxLength(1000)
         .setPlaceholder("Например 73 или мой elo 73");
 
-      const imageInput = new TextInputBuilder()
-        .setCustomId("elo_submit_image_url")
-        .setLabel("Ссылка на изображение. Необязательно")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false)
-        .setMaxLength(1000)
-        .setPlaceholder("Если пусто, потом просто отправишь картинку в канал");
-
-      modal.addComponents(
-        new ActionRowBuilder().addComponents(textInput),
-        new ActionRowBuilder().addComponents(imageInput)
-      );
-
+      modal.addComponents(new ActionRowBuilder().addComponents(textInput));
       await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.customId === "elo_submit_card") {
+      await interaction.reply(await buildMyCardPayload(client, interaction.user.id));
+      scheduleDeleteInteractionReply(interaction);
+      return;
+    }
+
+    if (interaction.customId === "elo_submit_cancel") {
+      clearSubmitSession(interaction.user.id);
+      await interaction.reply({ content: "Ок. Отменено.", ephemeral: true });
+      scheduleDeleteInteractionReply(interaction);
       return;
     }
 
@@ -2439,7 +2469,7 @@ ELO: ${rating.elo}
       rating.username = user.username;
       rating.elo = sub.elo;
       rating.tier = tier;
-      rating.proofUrl = sub.screenshotUrl;
+      rating.proofUrl = sub.reviewAttachmentUrl || sub.screenshotUrl;
       rating.avatarUrl = normalizeDiscordAvatarUrl((member?.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 })) || user.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 }) || user.defaultAvatarURL || "");
       rating.updatedAt = new Date().toISOString();
 
@@ -2454,7 +2484,7 @@ ELO: ${rating.elo}
       await interaction.message.edit({ embeds: [buildReviewEmbed(sub, "approved")], components: [] }).catch(() => {});
       await interaction.reply({ content: "Одобрено. Тир-лист обновлён. PNG тоже обновлён, если был настроен.", ephemeral: true });
 
-      await dmUser(client, sub.userId, `Одобрено.\nELO: ${sub.elo}\nТир: ${sub.tier}\nПруф: ${sub.screenshotUrl}`);
+      await dmUser(client, sub.userId, `Одобрено.\nELO: ${sub.elo}\nТир: ${sub.tier}\nПруф: ${sub.reviewAttachmentUrl || sub.screenshotUrl}`);
       await logLine(client, `APPROVE: <@${sub.userId}> ELO ${sub.elo} -> Tier ${sub.tier} (id ${submissionId}) by ${interaction.user.tag}`);
       saveDB(db);
       return;
@@ -2507,7 +2537,6 @@ ELO: ${rating.elo}
   if (interaction.isModalSubmit()) {
     if (interaction.customId === "elo_submit_modal") {
       const rawText = (interaction.fields.getTextInputValue("elo_submit_text") || "").trim();
-      const imageUrl = (interaction.fields.getTextInputValue("elo_submit_image_url") || "").trim();
 
       const blockReason = getSubmitEligibilityError(interaction.user.id, rawText);
       if (blockReason) {
@@ -2516,36 +2545,9 @@ ELO: ${rating.elo}
         return;
       }
 
-      if (imageUrl) {
-        if (!isLikelyImageUrl(imageUrl)) {
-          await interaction.reply({
-            content: "Ссылка на изображение выглядит невалидно. Либо вставь прямую ссылку на картинку, либо оставь поле пустым и потом отправь картинку следующим сообщением в канал.",
-            ephemeral: true
-          });
-          scheduleDeleteInteractionReply(interaction);
-          return;
-        }
-
-        await interaction.deferReply({ ephemeral: true });
-        try {
-          await createPendingSubmissionFromUrl(client, {
-            user: interaction.user,
-            member: interaction.member,
-            rawText,
-            screenshotUrl: imageUrl,
-            messageUrl: imageUrl,
-          });
-          await interaction.editReply("Заявка отправлена на проверку модерам.");
-        } catch (err) {
-          await interaction.editReply(String(err?.message || err || "Не удалось отправить заявку."));
-        }
-        scheduleDeleteInteractionReply(interaction);
-        return;
-      }
-
       setSubmitSession(interaction.user.id, { rawText });
       await interaction.reply({
-        content: "Первый шаг принят. Теперь отправь **одним следующим сообщением** картинку в этот канал. Бот сам удалит её после обработки.",
+        content: "Текст принят. Теперь отправь **одним следующим сообщением** скрин в этот канал. Можно обычным вложением или просто вставить картинку из буфера через **Ctrl+V**. Бот сам удалит её после обработки.",
         ephemeral: true
       });
       scheduleDeleteInteractionReply(interaction);
