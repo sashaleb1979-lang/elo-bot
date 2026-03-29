@@ -40,6 +40,7 @@ const PENDING_EXPIRE_HOURS = 48;     // протухание pending
 const SUBMIT_SESSION_EXPIRE_MS = 10 * 60 * 1000;
 const SUBMIT_UI_DELETE_MS = 25 * 1000;
 const SUBMIT_PUBLIC_DELETE_MS = 10 * 1000;
+const SUBMIT_PANEL_RESEND_INTERVAL_MS = 30 * 60 * 1000; // переотправка панели каждые 30 минут
 
 // TODO: ВПИШИ СВОИ НАЗВАНИЯ ТИРОВ ТУТ (пока цифры)
 // (можно менять через /elo labels тоже)
@@ -1458,6 +1459,35 @@ async function ensureSubmitHubMessage(client, forcedChannelId = null) {
   return msg;
 }
 
+async function repostSubmitHubMessage(client) {
+  const state = getSubmitPanelState();
+  const channelId = state.channelId || SUBMIT_CHANNEL_ID;
+  if (!channelId) return null;
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  if (!channel?.isTextBased()) return null;
+
+  // Удаляем старое сообщение, если оно есть
+  if (state.messageId) {
+    const oldMsg = await channel.messages.fetch(state.messageId).catch(() => null);
+    if (oldMsg) await oldMsg.delete().catch(() => {});
+    state.messageId = "";
+  }
+
+  // Отправляем новое сообщение (оно окажется внизу канала)
+  const payload = {
+    embeds: [buildSubmitHubEmbed()],
+    components: buildSubmitHubComponents()
+  };
+  const msg = await channel.send(payload).catch(() => null);
+  if (!msg) return null;
+
+  state.messageId = msg.id;
+  state.channelId = channelId;
+  saveDB(db);
+  return msg;
+}
+
 async function createPendingSubmissionFromUrl(client, { user, member, rawText, screenshotUrl, messageUrl }) {
   const elo = parseElo(rawText);
   const tier = elo ? tierFor(elo) : null;
@@ -1880,6 +1910,15 @@ client.once("ready", async () => {
   } catch (e) {
     console.error("Submit panel setup failed:", e?.message || e);
   }
+
+  // Переотправляем панель каждые 30 минут, чтобы она всегда была внизу канала
+  setInterval(async () => {
+    try {
+      await repostSubmitHubMessage(client);
+    } catch (e) {
+      console.error("Submit panel resend failed:", e?.message || e);
+    }
+  }, SUBMIT_PANEL_RESEND_INTERVAL_MS);
 
   console.log("Ready");
 });
