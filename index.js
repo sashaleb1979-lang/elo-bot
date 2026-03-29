@@ -98,7 +98,10 @@ db.config.graphicTierlist.tierColors ||= { 5: "#ff6b6b", 4: "#ff9f43", 3: "#feca
 db.config.graphicTierlist.panel ||= { selectedTier: 5 };
 if (!db.config.graphicTierlist.messageText) db.config.graphicTierlist.messageText = DEFAULT_GRAPHIC_MESSAGE_TEXT;
 if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
-if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
+if (GRAPHIC_TIERLIST_CHANNEL_ID && db.config.graphicTierlist.dashboardChannelId !== GRAPHIC_TIERLIST_CHANNEL_ID) {
+  db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
+  db.config.graphicTierlist.dashboardMessageId = "";
+}
 saveDB(db);
 
 // ====== HELPERS ======
@@ -352,8 +355,9 @@ function getGraphicTierlistState() {
   db.config.graphicTierlist.panel ||= { selectedTier: 5 };
   if (!db.config.graphicTierlist.messageText) db.config.graphicTierlist.messageText = DEFAULT_GRAPHIC_MESSAGE_TEXT;
   if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
-  if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) {
+  if (GRAPHIC_TIERLIST_CHANNEL_ID && db.config.graphicTierlist.dashboardChannelId !== GRAPHIC_TIERLIST_CHANNEL_ID) {
     db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
+    db.config.graphicTierlist.dashboardMessageId = "";
   }
   for (const t of GRAPHIC_TIER_ORDER) {
     if (!db.config.graphicTierlist.tierColors[t]) db.config.graphicTierlist.tierColors[t] = DEFAULT_GRAPHIC_TIER_COLORS[t];
