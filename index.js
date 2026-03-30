@@ -1467,6 +1467,12 @@ async function repostSubmitHubMessage(client) {
   const channel = await client.channels.fetch(channelId).catch(() => null);
   if (!channel?.isTextBased()) return null;
 
+  // Проверяем, есть ли сообщения после панели. Если нет — переотправлять не нужно.
+  if (state.messageId) {
+    const after = await channel.messages.fetch({ after: state.messageId, limit: 1 }).catch(() => null);
+    if (after && after.size === 0) return null; // панель уже последняя
+  }
+
   // Удаляем старое сообщение, если оно есть
   if (state.messageId) {
     const oldMsg = await channel.messages.fetch(state.messageId).catch(() => null);
@@ -1928,13 +1934,10 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (message.channelId !== SUBMIT_CHANNEL_ID) return;
 
+  // Обрабатываем только тех, кто сейчас в процессе подачи заявки (ждём скрин).
+  // Остальные сообщения — это обычный чат, не трогаем их.
   const session = getActiveSubmitSession(message.author.id);
-  if (!session) {
-    const warn = await message.reply("Заявки тут теперь подаются только через кнопку **Отправить заявку ELO** ниже.").catch(() => null);
-    if (warn) scheduleDeleteMessage(warn);
-    await message.delete().catch(() => {});
-    return;
-  }
+  if (!session) return;
 
   const pending = getPendingSubmissionForUser(message.author.id);
   if (pending) {
